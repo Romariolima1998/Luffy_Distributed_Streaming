@@ -1,0 +1,46 @@
+# Build, pacotes gerados e cache do Gradle.
+# Os pacotes Windows/Linux devem ser publicados em GitHub Releases, nao versionados no repositorio.
+.gradle/
+build/
+out/
+.gradle/
+.gradle-user-home/
+build/
+**/build/
+Luffyforwindows/runtime/
+.idea/
+*.iml
+
+# Dados locais do Luffy: identidade, downloads, cache, banco e diagnosticos.
+.lufi/
+**/.lufi/
+diagnostic-p2p/
+downloads/
+cache/
+logs/
+*.log
+*.hprof
+
+# Configuracao local e possiveis credenciais.
+.env
+.env.*
+!.env.example
+local.properties
+secrets.properties
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Arquivos da IDE e do sistema operacional.
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

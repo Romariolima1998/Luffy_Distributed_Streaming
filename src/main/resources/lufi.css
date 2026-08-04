@@ -1,0 +1,16 @@
+.root { -fx-font-family: "Segoe UI", sans-serif; -fx-background-color: #12131a; -fx-text-fill: #edf0f7; }
+.label { -fx-text-fill: #edf0f7; } .muted { -fx-text-fill: #9ba3b5; }
+.logo { -fx-font-size: 28px; -fx-font-weight: 800; -fx-text-fill: #a78bfa; }
+.hero { -fx-font-size: 30px; -fx-font-weight: 800; } .section-title { -fx-font-size: 24px; -fx-font-weight: 700; }
+.tab-pane .tab-header-area .tab-header-background { -fx-background-color: transparent; }
+.tab { -fx-background-color: #1a1c26; } .tab:selected { -fx-background-color: #292339; }
+.tab-label { -fx-text-fill: #dce0ea; } .text-field, .combo-box { -fx-background-color: #222531; -fx-text-fill: #edf0f7; -fx-prompt-text-fill: #7f8798; }
+.button { -fx-background-color: #7c5ce0; -fx-text-fill: white; -fx-font-weight: 700; -fx-background-radius: 7; }
+.button:hover { -fx-background-color: #9277ea; } .player { -fx-background-color: #1a1c26; -fx-background-radius: 12; }
+.list-view { -fx-background-color: #1a1c26; }
+.tree-view { -fx-background-color: #1a1c26; } .split-pane { -fx-background-color: transparent; -fx-padding: 0; }
+.split-pane-divider { -fx-background-color: #303342; -fx-padding: 0 1 0 1; }
+.library-panel, .content-panel, .link-panel { -fx-background-color: #1a1c26; -fx-background-radius: 10; -fx-padding: 14; }
+.panel-title { -fx-font-size: 13px; -fx-font-weight: 700; -fx-text-fill: #a78bfa; } .library-name { -fx-font-size: 18px; -fx-font-weight: 700; }
+.player-controls { -fx-background-color: rgba(18, 19, 26, 0.92); -fx-background-radius: 10; -fx-padding: 10 14 10 14; }
+.player-exit { -fx-background-color: rgba(18, 19, 26, 0.92); -fx-padding: 10 14 10 14; }

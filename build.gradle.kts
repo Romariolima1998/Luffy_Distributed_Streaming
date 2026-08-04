@@ -1,0 +1,186 @@
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+
+plugins {
+    application
+    java
+    id("org.openjfx.javafxplugin") version "0.1.0"
+}
+
+group = "dev.luffy"
+version = "0.1.0"
+val javafxVersion = "21.0.5"
+
+repositories { mavenCentral() }
+
+java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }
+
+javafx {
+    version = javafxVersion
+    modules = listOf("javafx.controls", "javafx.graphics", "javafx.media")
+}
+
+val linuxJavafx by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+dependencies {
+    implementation("org.xerial:sqlite-jdbc:3.47.1.0")
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
+    implementation("com.github.atomashpolskiy:bt-core:1.10")
+    implementation("com.github.atomashpolskiy:bt-dht:1.10")
+    implementation("com.offbynull.portmapper:portmapper:2.0.6")
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+
+    listOf("base", "graphics", "controls", "media").forEach { module ->
+        add(linuxJavafx.name, "org.openjfx:javafx-$module:$javafxVersion:linux") {
+            isTransitive = false
+        }
+    }
+}
+
+application { mainClass.set("dev.lufi.ui.LufiApplication") }
+tasks.test { useJUnitPlatform() }
+tasks.withType<JavaCompile>().configureEach { options.release.set(21); options.encoding = "UTF-8" }
+
+/**
+ * Gera os tres artefatos oficiais do swarm Ola Luffy somente quando eles ainda
+ * nao existem. Uma execucao posterior apenas valida os bytes versionados: ela
+ * nunca os reescreve, para impedir que instalacoes recebam outro infoHash.
+ */
+tasks.register("generateOfficialBootstrapArtifacts") {
+    group = "distribution"
+    description = "Gera uma unica vez os artefatos BitTorrent oficiais do swarm Ola Luffy."
+    doLast {
+        val bootstrapDirectory = layout.projectDirectory.dir("src/main/resources/bootstrap").asFile
+        val content = "Olá Luffy".toByteArray(StandardCharsets.UTF_8)
+        val pieceHash = MessageDigest.getInstance("SHA-1").digest(content)
+        val info = "d6:lengthi10e4:name13:ola-luffy.txt12:piece lengthi1048576e6:pieces20:"
+            .toByteArray(StandardCharsets.US_ASCII) + pieceHash + byteArrayOf('e'.code.toByte())
+        val infoHash = MessageDigest.getInstance("SHA-1").digest(info)
+            .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        check(infoHash == "08e3e48a8916ff0b0fdc04fa903977d5efa404c7") {
+            "O gerador deterministico do swarm Ola Luffy produziu um infoHash inesperado: $infoHash"
+        }
+        val torrent = "d4:info".toByteArray(StandardCharsets.US_ASCII) + info + byteArrayOf('e'.code.toByte())
+        val magnet = "magnet:?xt=urn:btih:$infoHash&dn=Ol%C3%A1+Luffy"
+            .toByteArray(StandardCharsets.US_ASCII)
+
+        fun createOnceOrValidate(fileName: String, expected: ByteArray) {
+            val target = bootstrapDirectory.resolve(fileName)
+            if (target.isFile) {
+                check(target.readBytes().contentEquals(expected)) {
+                    "O artefato oficial $fileName nao pode ser modificado. Restaure os bytes versionados."
+                }
+                return
+            }
+            check(!target.exists()) { "O caminho de artefato oficial nao e um arquivo: $target" }
+            check(bootstrapDirectory.mkdirs() || bootstrapDirectory.isDirectory) {
+                "Nao foi possivel criar $bootstrapDirectory"
+            }
+            target.writeBytes(expected)
+        }
+
+        createOnceOrValidate("ola-luffy.txt", content)
+        createOnceOrValidate("ola-luffy.torrent", torrent)
+        createOnceOrValidate("ola-luffy-magnet.txt", magnet)
+    }
+}
+
+// Testes unitários ficam em src/test. Os testes entre duas máquinas reais só
+// são compilados/executados pela tarefa explícita integrationTest.
+val integrationTest by sourceSets.creating {
+    java.srcDir("src/integrationTest/java")
+    resources.srcDir("src/integrationTest/resources")
+    compileClasspath += sourceSets.main.get().output
+    compileClasspath += configurations.testRuntimeClasspath.get()
+    runtimeClasspath += output
+    runtimeClasspath += compileClasspath
+}
+configurations[integrationTest.implementationConfigurationName].extendsFrom(configurations.testImplementation.get())
+configurations[integrationTest.runtimeOnlyConfigurationName].extendsFrom(configurations.testRuntimeOnly.get())
+tasks.register<Test>("integrationTest") {
+    group = "verification"
+    description = "Executa testes P2P reais somente com LUFFY_REAL_NETWORK_TESTS=true."
+    testClassesDirs = integrationTest.output.classesDirs
+    classpath = integrationTest.runtimeClasspath
+    useJUnitPlatform()
+    onlyIf { providers.environmentVariable("LUFFY_REAL_NETWORK_TESTS").orNull == "true" }
+}
+
+tasks.register<Jar>("executableJar") {
+    group = "distribution"
+    description = "Gera um JAR executável do Luffy com as dependências incluídas."
+    archiveBaseName.set("Luffy")
+    archiveClassifier.set("all")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes["Main-Class"] = "dev.lufi.ui.LuffyLauncher" }
+    from(sourceSets.main.get().output)
+    dependsOn(configurations.runtimeClasspath)
+    from({ configurations.runtimeClasspath.get().filter { it.name.endsWith(".jar") }.map { zipTree(it) } })
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "module-info.class", "META-INF/versions/**/module-info.class")
+}
+
+tasks.register<Jar>("linuxExecutableJar") {
+    group = "distribution"
+    description = "Gera o JAR executável do Luffy para Linux, com JavaFX nativo Linux."
+    archiveBaseName.set("Luffy")
+    archiveClassifier.set("linux")
+    destinationDirectory.set(layout.buildDirectory.dir("linux/artifacts"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest { attributes["Main-Class"] = "dev.lufi.ui.LuffyLauncher" }
+    from(sourceSets.main.get().output)
+    dependsOn(configurations.runtimeClasspath, linuxJavafx)
+    from({
+        configurations.runtimeClasspath.get()
+            .filterNot { it.name.matches(Regex("javafx-.*-win\\.jar")) }
+            .plus(linuxJavafx)
+            .filter { it.name.endsWith(".jar") }
+            .map { zipTree(it) }
+    })
+    exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "module-info.class", "META-INF/versions/**/module-info.class")
+}
+
+tasks.register<Copy>("linuxDistribution") {
+    group = "distribution"
+    description = "Monta a pasta de distribuição Linux do Luffy."
+    dependsOn("linuxExecutableJar")
+    from(tasks.named<Jar>("linuxExecutableJar"))
+    from("src/linux")
+    into(layout.buildDirectory.dir("linux/Luffy"))
+}
+
+tasks.register<Zip>("linuxDistributionZip") {
+    group = "distribution"
+    description = "Gera o pacote ZIP da distribuição Linux do Luffy."
+    dependsOn("linuxDistribution")
+    archiveBaseName.set("Luffy")
+    archiveClassifier.set("linux")
+    destinationDirectory.set(layout.buildDirectory.dir("linux"))
+    from(layout.buildDirectory.dir("linux/Luffy"))
+}
+
+tasks.register<Exec>("windowsAppImage") {
+    group = "distribution"
+    description = "Gera a pasta Windows com Luffy.exe para uma regra de firewall exclusiva do aplicativo."
+    val executableJar = tasks.named<Jar>("executableJar")
+    dependsOn(executableJar)
+    inputs.file(executableJar.flatMap { it.archiveFile })
+    doFirst { delete(layout.buildDirectory.dir("windows/Luffy")) }
+    val jpackage = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }.get().metadata.installationPath.file("bin/jpackage.exe").asFile
+    executable = jpackage.absolutePath
+    args(
+        "--type", "app-image",
+        "--dest", layout.buildDirectory.dir("windows").get().asFile.absolutePath,
+        "--input", layout.buildDirectory.dir("libs").get().asFile.absolutePath,
+        "--name", "Luffy",
+        "--main-jar", "Luffy-0.1.0-all.jar",
+        "--main-class", "dev.lufi.ui.LuffyLauncher",
+        "--java-options", "-Dfile.encoding=UTF-8"
+    )
+    outputs.dir(layout.buildDirectory.dir("windows/Luffy"))
+}
