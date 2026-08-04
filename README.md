@@ -1,6 +1,25 @@
 # Luffy
 
-Cliente desktop P2P para streaming progressivo. Esta primeira entrega estabelece um MVP funcional de catálogo local, cache, magnet links e interface JavaFX, preparado para conectar um motor BitTorrent real sem alterar a UI ou as regras de negócio.
+Luffy é uma plataforma de streaming e compartilhamento de vídeos totalmente distribuída (P2P), desenvolvida em Java 21 sobre o protocolo BitTorrent. Seu objetivo é permitir que usuários assistam e compartilhem vídeos diretamente entre si, sem depender de servidores centrais para armazenar ou distribuir o conteúdo.
+
+O projeto utiliza DHT, PEX, uTP e técnicas de travessia de NAT (BEP 55), além de uma camada própria de descoberta e rendezvous para aumentar a conectividade entre peers, buscando uma rede mais escalável, resiliente e descentralizada.
+
+<img alt="Captura de tela 2026-08-04 153810.png" data-hpc="true" containertiming="hpc" src="https://github.com/Romariolima1998/Luffy_Distributed_Streaming/blob/main/imagens/Captura%20de%20tela%202026-08-04%20153810.png?raw=true" style="max-width: 100%;">
+
+## baixe o luffy
+
+
+[download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/raw/refs/heads/main/Luffyforwindows/Luffy.exe)
+
+[download para linux](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/raw/refs/heads/main/Luffyforlinux/Luffy-0.1.0-linux.zip)
+
+requizito para linux
+
+```
+ sudo apt update && sudo apt install openjdk-21-jdk -y
+```
+
+
 
 ## Pré-requisitos e execução
 
@@ -8,16 +27,17 @@ Cliente desktop P2P para streaming progressivo. Esta primeira entrega estabelece
 - Gradle 8.5+ ou um wrapper Gradle gerado localmente
 - FFmpeg no `PATH` para miniaturas e perfis de vídeo futuros
 
-```powershell
+```
+powershell
 gradle run
 gradle test
 ```
 
-Os dados ficam em `~/.lufi` por padrão. Na primeira abertura, escolha o limite do cache. O botão **Abrir magnet** aceita `magnet:?xt=urn:btih:...`; no MVP ele cria uma sessão de streaming e deixa explícito quando ainda não há motor P2P conectado.
+Os dados ficam em ~/.lufi por padrão. Na primeira abertura, escolha o limite do cache. O botão **Abrir magnet** aceita magnet:?xt=urn:btih:...`; no MVP ele cria uma sessão de streaming e deixa explícito quando ainda não há motor P2P conectado.
 
 ## Decisões de arquitetura
 
-- **Portas e adaptadores:** `domain` contém regras puras; `application` coordena casos de uso; `infrastructure` é substituível. `TorrentGateway` é a porta para uma implementação BitTorrent futura (por exemplo, jlibtorrent em processo isolado).
+- **Portas e adaptadores:** domain contém regras puras; `application` coordena casos de uso; `infrastructure` é substituível. `TorrentGateway` é a porta para uma implementação BitTorrent futura (por exemplo, jlibtorrent em processo isolado).
 - **Streaming por peças:** `StreamingSession` expõe o estado de buffer e a política `PieceScheduler`; o adaptador BitTorrent deverá pedir primeiro a janela à frente do playhead, com rarest-first fora dessa janela.
 - **Segurança:** magnets são dados não confiáveis; o parser só aceita BTIH hexadecimal de 40 caracteres. Uma versão produtiva ainda deve validar metadados/tamanhos e limitar trackers.
 - **Cache:** `CachePolicy` decide LRU por último acesso, nunca apaga arquivos originários da biblioteca. A persistência é local SQLite.
