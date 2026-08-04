@@ -6,7 +6,7 @@ O projeto utiliza DHT, PEX, uTP e técnicas de travessia de NAT (BEP 55), além 
 
 <img alt="Captura de tela 2026-08-04 153810.png" data-hpc="true" containertiming="hpc" src="https://github.com/Romariolima1998/Luffy_Distributed_Streaming/blob/main/imagens/Captura%20de%20tela%202026-08-04%20153810.png?raw=true" style="max-width: 100%;">
 
-## baixe o luffy
+## baixe o luffy e execulte sem compilar
 
 
 [download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/raw/refs/heads/main/Luffyforwindows/Luffy.exe)
@@ -21,7 +21,7 @@ requizito para linux
 
 
 
-## Pré-requisitos e execução
+## Pré-requisitos e execução caso voce queira compilar
 
 - JDK 21 (não JRE 8)
 - Gradle 8.5+ ou um wrapper Gradle gerado localmente
