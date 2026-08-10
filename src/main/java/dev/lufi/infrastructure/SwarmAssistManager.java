@@ -211,14 +211,6 @@ public final class SwarmAssistManager implements AutoCloseable {
     }
 
     private static String toMagnetUri(MagnetLink magnet) {
-        StringBuilder value = new StringBuilder("magnet:?xt=urn:btih:").append(magnet.infoHash());
-        magnet.displayName().ifPresent(name -> value.append("&dn=").append(java.net.URLEncoder.encode(name, java.nio.charset.StandardCharsets.UTF_8)));
-        magnet.parameters().forEach((key, parameter) -> {
-            if (!key.equalsIgnoreCase("xt") && !key.equalsIgnoreCase("dn") && parameter != null && !parameter.isBlank()) {
-                value.append('&').append(java.net.URLEncoder.encode(key, java.nio.charset.StandardCharsets.UTF_8))
-                        .append('=').append(java.net.URLEncoder.encode(parameter, java.nio.charset.StandardCharsets.UTF_8));
-            }
-        });
-        return value.toString();
+        return magnet.toUri();
     }
 }

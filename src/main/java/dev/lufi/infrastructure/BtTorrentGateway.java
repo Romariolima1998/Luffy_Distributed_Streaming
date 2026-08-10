@@ -77,6 +77,10 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     private final Path cacheDirectory;
     private final P2pDiagnostics diagnostics;
     private final Map<String, BtClient> sessions = new ConcurrentHashMap<>();
+    /** Permite aguardar o encerramento efetivo de um cliente antes de reutilizar o mesmo torrent na runtime. */
+    private final Map<BtClient, CompletableFuture<?>> clientProcessCompletions = new ConcurrentHashMap<>();
+    /** Prévia isolada: impede que prioridades SKIP contaminem a sessão principal do torrent. */
+    private final Map<String, BtRuntime> metadataPreviewRuntimes = new ConcurrentHashMap<>();
     /** Swarms cujo conteúdo existe localmente: esta é a lista de SEEDING SWARMS. */
     private final Map<String, BtClient> seedingSessions = new ConcurrentHashMap<>();
     /** Sessões que participam do swarm, mas não podem solicitar nem semear conteúdo. */
@@ -102,6 +106,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** O papel pode mudar de participação passiva para download sem duplicar os listeners do torrent. */
     private final Map<String, String> torrentDiagnosticRoles = new ConcurrentHashMap<>();
     private final Map<String, TransferSnapshot> transferSnapshots = new ConcurrentHashMap<>();
+    /** Peças iniciais confirmadas por torrent; necessárias antes de entregar um arquivo pré-alocado ao player. */
+    private final StreamingPiecePrefixTracker streamingPiecePrefixes = new StreamingPiecePrefixTracker();
     private final PeerConnectivityManager peerConnectivity;
     private final SwarmAssistConnectionPolicy swarmAssistConnectionPolicy = new SwarmAssistConnectionPolicy();
     private volatile SwarmAssistPolicy activeSwarmAssistPolicy = SwarmAssistPolicy.defaults();
@@ -135,10 +141,14 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** Adaptador para a política persistida; o motor não acessa SQLite nem a UI. */
     private volatile Consumer<SwarmAssistActivity> swarmAssistActivityListener = ignored -> { };
     private volatile ConnectivityProfile connectivity = ConnectivityProfile.unavailable();
+    private volatile DhtLookupRuntimeSettings dhtLookupRuntimeSettings = DhtLookupRuntimeSettings.defaults();
     private volatile BtRuntime runtime;
+    private final AtomicBoolean shuttingDown = new AtomicBoolean();
+    private final Object dhtLookupShutdownMonitor = new Object();
+    private final Map<Thread, CompletableFuture<Integer>> pendingDhtLookups = new ConcurrentHashMap<>();
     /** Runtime DHT sem torrents: no modo outbound-only ela só consulta peers e nunca anuncia esta máquina. */
-    private volatile BtRuntime ipv4DhtLookupRuntime;
-    private volatile BtRuntime ipv6DhtLookupRuntime;
+    private final DhtLookupRuntimeLifecycle ipv4DhtLookupLifecycle;
+    private final DhtLookupRuntimeLifecycle ipv6DhtLookupLifecycle;
     private volatile boolean transferRuntimeDhtAnnounceEnabled;
     private volatile BtRuntime ipv6Runtime;
     private volatile UtpTransportService utpTransport;
@@ -151,6 +161,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     public BtTorrentGateway(Path cacheDirectory, P2pDiagnostics diagnostics, LuffyNodeIdentity nodeIdentity) {
         this.cacheDirectory = cacheDirectory;
         this.diagnostics = diagnostics == null ? new P2pDiagnostics() : diagnostics;
+        this.ipv4DhtLookupLifecycle = dhtLookupLifecycle(false);
+        this.ipv6DhtLookupLifecycle = dhtLookupLifecycle(true);
         this.nodeIdentity = java.util.Objects.requireNonNull(nodeIdentity, "nodeIdentity");
         this.officialBootstrapSwarm = OfficialBootstrapSwarm.loadAndValidate();
         this.diagnostics.log("[BOOTSTRAP] Ola Luffy validado: infoHash=" + OfficialBootstrapSwarm.INFO_HASH
@@ -233,7 +245,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** Estado local para a aba de diagnóstico; não cria sockets nem muda a conectividade. */
     public String connectivityVisualReport(List<Inet4Address> localIpv4) {
         UtpTransportService utp = utpTransport;
-        boolean dhtListening = ipv4DhtLookupRuntime != null || ipv6DhtLookupRuntime != null
+        boolean dhtListening = ipv4DhtLookupLifecycle.isReady() || ipv6DhtLookupLifecycle.isReady()
                 || transferRuntimeDhtAnnounceEnabled && runtime != null;
         return ConnectivityVisualReport.render(connectivity, localIpv4, runtime != null,
                 utp != null && utp.isListening(), dhtListening);
@@ -249,10 +261,12 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         activeSwarmAssistPolicy = policy == null ? SwarmAssistPolicy.defaults() : policy;
         swarmAssistConnectionPolicy.setPolicy(activeSwarmAssistPolicy);
     }
-    /** Atualiza os limites globais sem alterar a runtime, a DHT ou clientes BitTorrent já ativos. */
+    /** Atualiza os limites globais e os limites de conexão da runtime, sem alterar DHT ou torrents ativos. */
     public void setConnectionLimits(ConnectionLimits limits) {
         globalConnectionBudget.setLimits(limits);
         ConnectionLimits current = globalConnectionBudget.limits();
+        if (runtime != null) applyConnectionLimits(runtime.getConfig(), current);
+        if (ipv6Runtime != null) applyConnectionLimits(ipv6Runtime.getConfig(), current);
         diagnostics.log(P2pDiagnostics.Layer.CONNECTIVITY, "CONNECTION BUDGET: stream/download="
                 + current.maxDownloadConnections() + "; seed=" + current.maxSeedConnections()
                 + "; rendezvous/overlay=" + current.maxOverlayConnections() + "; assist="
@@ -260,6 +274,17 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                 + "; total=" + current.maxTotalConnections() + ".");
     }
     public ConnectionLimits connectionLimits() { return globalConnectionBudget.limits(); }
+    /** Estado real do buffer, atualizado pelo callback do bt-core a cada segundo. */
+    public StreamingBufferStatus streamingBufferStatus(String infoHash) {
+        if (infoHash == null || infoHash.isBlank()) return StreamingBufferStatus.unavailable();
+        TransferSnapshot snapshot = transferSnapshots.get(infoHash.toLowerCase());
+        boolean active = isTorrentSessionActive(infoHash);
+        if (snapshot == null) return new StreamingBufferStatus(0, 0, 0, 0, 12, active);
+        int required = snapshot.piecesTotal() > 0 ? Math.min(12, snapshot.piecesTotal()) : 12;
+        int contiguousPrefix = streamingPiecePrefixes.contiguousPrefix(infoHash, snapshot.piecesTotal());
+        return new StreamingBufferStatus(snapshot.downloaded(), snapshot.piecesComplete(), contiguousPrefix,
+                snapshot.piecesTotal(), required, active);
+    }
     /** Atualiza somente os guardrails de abuso; conexoes BitTorrent estabelecidas nao sao tocadas. */
     public void setAbuseProtectionConfig(AbuseProtectionConfig config) {
         abuseProtection.setConfig(config);
@@ -279,6 +304,11 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
     public void setSwarmAssistActivityListener(Consumer<SwarmAssistActivity> listener) {
         swarmAssistActivityListener = listener == null ? ignored -> { } : listener;
+    }
+    public DhtLookupRuntimeSettings dhtLookupRuntimeSettings() { return dhtLookupRuntimeSettings; }
+    /** Applies to the next lookup runtime created after a failed start or application restart. */
+    public void setDhtLookupRuntimeSettings(DhtLookupRuntimeSettings settings) {
+        dhtLookupRuntimeSettings = settings == null ? DhtLookupRuntimeSettings.defaults() : settings;
     }
     /** A reprodução no player é atividade de primeiro plano e suspende Swarm Assist. */
     public void setForegroundPlaybackActive(boolean active) {
@@ -525,7 +555,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         Map<String, String> parameters = new LinkedHashMap<>(original.parameters());
         parameters.put("x.pe", local.getHostAddress() + ":" + connectivity.torrentListeningPort());
         diagnostics.log("MATRIZ LAN DIRECT: magnet inclui x.pe explícito " + parameters.get("x.pe") + ".");
-        return new MagnetLink(original.infoHash(), original.displayName(), parameters);
+        return new MagnetLink(original.infoHash(), original.displayName(), parameters, original.trackers());
     }
 
     private void scheduleDiagnosticDeadline(String infoHash, Path target, AtomicReference<BtClient> clientReference,
@@ -593,8 +623,25 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         if (mode == WatchMode.SHARE) removeFromSwarmAssist(magnet.infoHash());
         else pauseSwarmAssist(magnet.infoHash());
         BtClient previous = sessions.get(magnet.infoHash());
+        if (mode == WatchMode.TEMPORARY) {
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM DIAGNOSTIC RESTART: infoHash=" + magnet.infoHash()
+                    + "; selected=\"" + StreamingFileSelection.normalize(selectedRelativePath) + "\"; previousSession="
+                    + (previous == null ? "absent" : "present") + "; previousStarted="
+                    + (previous != null && previous.isStarted()) + ".");
+        }
+        // A sessão inicial de streaming mantém todos os arquivos em SKIP para obter
+        // somente os metadados. O bt-core não permite promover um arquivo que foi
+        // inicialmente SKIP. É essencial aguardar o cliente antigo terminar antes
+        // de criar a sessão selecionada, ou a runtime reutiliza o estado de SKIP e
+        // conclui o novo cliente sem solicitar nenhuma peça.
+        if (mode == WatchMode.TEMPORARY && selectedRelativePath != null && previous != null
+                && sessions.remove(magnet.infoHash(), previous)) {
+            scheduleSelectedStreamingRestart(magnet, selectedRelativePath, onMetadata, previous);
+            return;
+        }
         if (previous != null && sessions.remove(magnet.infoHash(), previous)) {
             previous.stop();
+            shutdownMetadataPreviewAfterClient(magnet.infoHash(), previous);
             statusListener.accept("Reiniciando a busca de peers para “" + magnet.displayName().orElse("vídeo") + "”…");
         }
         peerConnectivity.allowExplicitRetry(magnet.infoHash());
@@ -602,6 +649,63 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         holePunchAgent.allowExplicitRetry(magnet.infoHash());
         sessions.computeIfAbsent(magnet.infoHash(), ignored -> startDownload(magnet, mode, selectedRelativePath, onMetadata));
         registerMagnetPeerHint(magnet);
+    }
+
+    /**
+     * A troca de metadados para o arquivo escolhido precisa respeitar o lifecycle
+     * da mesma BtRuntime. Criar o segundo BtClient antes da conclusão do primeiro
+     * preserva o mapa de peças SKIP do cliente anterior dentro do bt-core.
+     */
+    private void scheduleSelectedStreamingRestart(MagnetLink magnet, String selectedRelativePath,
+                                                   Consumer<TorrentContent> onMetadata, BtClient previous) {
+        CompletableFuture<?> completion = clientProcessCompletions.get(previous);
+        BtRuntime metadataPreviewRuntime = metadataPreviewRuntimes.remove(magnet.infoHash());
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT WAIT: infoHash=" + magnet.infoHash()
+                + "; selected=\"" + StreamingFileSelection.normalize(selectedRelativePath) + "\"; completionKnown="
+                + (completion != null) + ".");
+        statusListener.accept("Preparando o arquivo escolhido para streaming…");
+        peerConnectivity.allowExplicitRetry(magnet.infoHash());
+        holePunchAgent.allowExplicitRetry(magnet.infoHash());
+        previous.stop();
+
+        Runnable startReplacement = () -> {
+            if (shuttingDown.get()) return;
+            shutdownRuntime(metadataPreviewRuntime);
+            BtClient replacement = startDownload(magnet, WatchMode.TEMPORARY, selectedRelativePath, onMetadata);
+            BtClient competing = sessions.putIfAbsent(magnet.infoHash(), replacement);
+            if (competing != null) {
+                replacement.stop();
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT CANCELLED: infoHash="
+                        + magnet.infoHash() + "; uma sessão mais recente já está ativa.");
+                return;
+            }
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT STARTED: infoHash="
+                    + magnet.infoHash() + "; selected=\"" + StreamingFileSelection.normalize(selectedRelativePath) + "\".");
+            registerMagnetPeerHint(magnet);
+        };
+        if (completion == null) {
+            Thread.startVirtualThread(startReplacement);
+        } else {
+            completion.handle((ignored, error) -> null)
+                    .thenRun(() -> Thread.startVirtualThread(startReplacement));
+        }
+    }
+
+    /** Encerra a runtime de prévia somente depois de o cliente que a usa finalizar. */
+    private void shutdownMetadataPreviewAfterClient(String infoHash, BtClient client) {
+        BtRuntime preview = metadataPreviewRuntimes.remove(infoHash);
+        if (preview == null) return;
+        CompletableFuture<?> completion = clientProcessCompletions.get(client);
+        if (completion == null) shutdownRuntime(preview);
+        else completion.handle((ignored, error) -> null).thenRun(() -> shutdownRuntime(preview));
+    }
+
+    private void shutdownRuntime(BtRuntime active) {
+        if (active == null) return;
+        try { active.shutdown(); }
+        catch (RuntimeException error) {
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM METADATA RUNTIME SHUTDOWN FAILED: " + message(error));
+        }
     }
 
     /** Mantém o arquivo original como seed enquanto a aplicação estiver aberta. */
@@ -634,28 +738,119 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
 
     private BtClient startDownload(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
         Path target = mode == WatchMode.SHARE ? documentsLuffyDirectory() : temporaryDirectory();
-        attachTorrentDiagnostics(magnet.infoHash(), "DOWNLOAD");
-        AtomicReference<BtClient> clientReference = new AtomicReference<>();
-        var builder = Bt.client(runtime()).storage(new FileSystemStorage(target))
-                .magnet(toUri(magnet)).sequentialSelector().afterTorrentFetched(torrent -> {
-                    Path folder = target.resolve(torrent.getName());
-                    List<Path> files = torrent.getFiles().stream().map(file -> file.getPathElements().stream().reduce(folder, Path::resolve, (left, right) -> right)).toList();
-                    onMetadata.accept(new TorrentContent(folder, files));
-                });
-        if (selectedRelativePath != null) builder.fileSelector(file -> {
-            String relative = String.join("/", file.getPathElements());
-            return relative.equals(selectedRelativePath) ? bt.torrent.fileselector.FilePriority.HIGH_PRIORITY : bt.torrent.fileselector.FilePriority.SKIP;
-        });
+        boolean metadataOnly = mode == WatchMode.TEMPORARY && selectedRelativePath == null;
+        BtRuntime activeRuntime = metadataOnly ? metadataPreviewRuntime(magnet.infoHash()) : runtime();
+        attachTorrentDiagnostics(activeRuntime, magnet.infoHash(), "DOWNLOAD");
+        AtomicInteger selectorCalls = new AtomicInteger();
+        AtomicInteger selectedFileCalls = new AtomicInteger();
         if (mode == WatchMode.TEMPORARY) {
-            builder.stopWhenDownloaded().afterDownloaded(ignored -> completeTemporaryWatchSession(magnet, clientReference.get()));
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM DIAGNOSTIC CREATE: infoHash=" + magnet.infoHash()
+                    + "; metadataOnly=" + metadataOnly + "; selected=\""
+                    + StreamingFileSelection.normalize(selectedRelativePath) + "\"; target=" + target + ".");
+        }
+        if (!metadataOnly) {
+            transferSnapshots.remove(magnet.infoHash().toLowerCase());
+            streamingPiecePrefixes.clear(magnet.infoHash());
+        }
+        AtomicReference<BtClient> clientReference = new AtomicReference<>();
+        var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target))
+                .magnet(toUri(magnet)).sequentialSelector().afterTorrentFetched(torrent -> {
+                    TorrentContent content = StreamingTorrentContentLayout.resolve(target, torrent.getName(),
+                            torrent.getFiles().stream().map(file -> file.getPathElements()).toList());
+                    Path folder = content.folder();
+                    List<Path> files = content.files();
+                    if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
+                        boolean found = torrent.getFiles().stream().anyMatch(file -> StreamingFileSelection.matches(selectedRelativePath, file.getPathElements()));
+                        String torrentPaths = torrent.getFiles().stream().limit(8)
+                                .map(file -> StreamingFileSelection.normalize(String.join("/", file.getPathElements())))
+                                .reduce((left, right) -> left + " | " + right).orElse("<nenhum>");
+                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM FILE SELECTION: requested=\""
+                                + StreamingFileSelection.normalize(selectedRelativePath) + "\"; matched=" + found
+                                + "; arquivos=" + torrent.getFiles().size() + "; paths=" + torrentPaths + ".");
+                        if (!found) statusListener.accept("O vídeo escolhido não foi encontrado nos metadados deste torrent.");
+                    }
+                    onMetadata.accept(content);
+                });
+        if (mode == WatchMode.TEMPORARY) {
+            // Primeiro buscamos apenas os metadados e mostramos a lista. Depois do clique
+            // do usuário uma nova sessão prioriza exclusivamente o arquivo escolhido.
+            builder.fileSelector(file -> {
+                boolean selected = StreamingFileSelection.matches(selectedRelativePath, file.getPathElements());
+                bt.torrent.fileselector.FilePriority priority = selected
+                        ? bt.torrent.fileselector.FilePriority.HIGH_PRIORITY
+                        : bt.torrent.fileselector.FilePriority.SKIP;
+                int invocation = selectorCalls.incrementAndGet();
+                if (selected) selectedFileCalls.incrementAndGet();
+                if (invocation <= 32) {
+                    diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SELECTOR DECISION: infoHash=" + magnet.infoHash()
+                            + "; invocation=" + invocation + "; requested=\""
+                            + StreamingFileSelection.normalize(selectedRelativePath) + "\"; candidate=\""
+                            + StreamingFileSelection.normalize(String.join("/", file.getPathElements())) + "\"; pathElements="
+                            + file.getPathElements().size() + "; selected=" + selected + "; priority=" + priority + ".");
+                } else if (invocation == 33) {
+                    diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SELECTOR DECISION: demais decisões foram suprimidas após 32 arquivos.");
+                }
+                return priority;
+            });
+            if (selectedRelativePath != null) {
+                builder.afterFilesChosen(() -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                        "STREAM FILES CHOSEN CALLBACK: infoHash=" + magnet.infoHash() + "; selected=\""
+                                + StreamingFileSelection.normalize(selectedRelativePath) + "\"; selectorCalls="
+                                + selectorCalls.get() + "; selectedCalls=" + selectedFileCalls.get() + "."));
+            }
+        }
+        if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
+            // O player pode ainda estar lendo o buffer quando o BitTorrent marca o
+            // arquivo como concluído. A sessão só deve ser liberada quando o usuário
+            // encerrar a reprodução, nunca automaticamente neste callback.
+            builder.afterDownloaded(ignored -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                    "STREAM DOWNLOAD COMPLETE: infoHash=" + magnet.infoHash() + "; sessão mantida para reprodução."));
         } else if (mode == WatchMode.SHARE) {
             builder.afterDownloaded(ignored -> markDownloadedSwarmAsSeed(magnet, clientReference.get()));
         }
         BtClient client = builder.build();
         clientReference.set(client);
-        startClient("Download", magnet.displayName().orElse("vídeo"), magnet.infoHash(), client, () -> { });
+        startClient(metadataOnly ? "Metadata" : "Download", magnet.displayName().orElse("vídeo"), magnet.infoHash(), client, () -> { });
+        if (metadataOnly) connectKnownTcpPeersToMetadataPreview(magnet.infoHash(), activeRuntime);
         reportMissingMetadataAfterDelay(magnet, client);
         return client;
+    }
+
+    /**
+     * O bt-core mantém o estado de arquivos SKIP por TorrentId dentro de uma
+     * BtRuntime. A prévia vive separadamente para que a sessão principal possa
+     * selecionar o vídeo depois de os metadados chegarem.
+     */
+    private BtRuntime metadataPreviewRuntime(String infoHash) {
+        BtRuntime current = metadataPreviewRuntimes.get(infoHash);
+        if (current != null) return current;
+        BtRuntime created = BtRuntime.builder(metadataPreviewNetworkConfig()).disableAutomaticShutdown().build();
+        BtRuntime existing = metadataPreviewRuntimes.putIfAbsent(infoHash, created);
+        if (existing != null) {
+            shutdownRuntime(created);
+            return existing;
+        }
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM METADATA RUNTIME STARTED: infoHash=" + infoHash
+                + "; finalidade=lista-de-arquivos; transferência de peças=SKIP.");
+        return created;
+    }
+
+    /** Repassa apenas endpoints TCP já descobertos à prévia, que não participa da DHT nem anuncia conteúdo. */
+    private void connectKnownTcpPeersToMetadataPreview(String infoHash, BtRuntime previewRuntime) {
+        TorrentId torrentId = TorrentId.fromBytes(hexBytes(infoHash));
+        int forwarded = 0;
+        for (PeerConnectivityManager.PeerState state : peerConnectivity.peersFor(infoHash)) {
+            if (state.endpoint().transport() != PeerConnectivityManager.Transport.TCP) continue;
+            try {
+                previewRuntime.service(IPeerRegistry.class).addPeer(torrentId,
+                        InetPeer.build(state.endpoint().address(), state.endpoint().port()));
+                forwarded++;
+            } catch (RuntimeException ignored) {
+                // Uma nova observação DHT/PEX poderá reenviar este endpoint.
+            }
+        }
+        if (forwarded > 0) diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                "STREAM METADATA PEERS FORWARDED: infoHash=" + infoHash + "; tcpPeers=" + forwarded + ".");
     }
 
     /** O download compartilhado termina como SEEDING SWARM e fica fora de Swarm Assist. */
@@ -1000,7 +1195,10 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** A conexão recebida só é classificada após o handshake, quando o torrent é conhecido. */
     private void enforceAcceptedConnectionBudget(String infoHash, Peer peer, int remotePort) {
         if (peer == null || remotePort < 1 || remotePort > 65_535) return;
-        GlobalConnectionBudget.Snapshot snapshot = globalConnectionBudget.snapshot(globalConnectionSlots());
+        // A admissão já considera tentativas pendentes. No instante posterior
+        // ao handshake, porém, elas não devem fechar a conexão recém-aceita e
+        // impedir metadata/bitfield de chegar ao torrent.
+        GlobalConnectionBudget.Snapshot snapshot = globalConnectionBudget.acceptedSnapshot(globalConnectionSlots());
         ConnectionLimits limits = connectionLimits();
         ConnectionRole incomingRole = connectionRoleFor(infoHash, strategyForAcceptedConnection(infoHash, peer, remotePort));
         boolean overTotal = snapshot.total() > limits.maxTotalConnections();
@@ -1026,19 +1224,27 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
 
     private bt.net.ConnectionKey selectBudgetVictim(String incomingKey, ConnectionRole incomingRole, boolean categoryViolation) {
-        return bootstrapPeerConnections.connectionKeys().stream()
+        List<bt.net.ConnectionKey> candidates = bootstrapPeerConnections.connectionKeys().stream()
                 .filter(key -> {
                     String infoHash = hex(key.getTorrentId());
                     ConnectionRole role = connectionRoleFor(infoHash,
                             strategyForAcceptedConnection(infoHash, key.getPeer(), key.getRemotePort()));
                     return categoryViolation ? sameBudgetCategory(role, incomingRole) : role.priority() >= incomingRole.priority();
                 })
+                .toList();
+        // O peer que acabou de concluir o handshake ainda não teve oportunidade de
+        // enviar seu bitfield. Fechá-lo sempre aqui descartava justamente o peer
+        // que poderia entregar metadados ou as primeiras peças do streaming.
+        List<bt.net.ConnectionKey> alternatives = candidates.stream().filter(key -> !connectionKey(hex(key.getTorrentId()),
+                key.getPeer().getInetAddress(), key.getRemotePort()).equals(incomingKey)).toList();
+        return (alternatives.isEmpty() ? candidates : alternatives).stream()
                 .max(java.util.Comparator.comparingInt((bt.net.ConnectionKey key) -> {
                     String infoHash = hex(key.getTorrentId());
                     return connectionRoleFor(infoHash,
                             strategyForAcceptedConnection(infoHash, key.getPeer(), key.getRemotePort())).priority();
-                }).thenComparing(key -> connectionKey(hex(key.getTorrentId()), key.getPeer().getInetAddress(),
-                        key.getRemotePort()).equals(incomingKey)))
+                }).thenComparingInt(key -> bootstrapPeerConnections.hasAdvertisedPieces(key) ? 0 : 1)
+                        .thenComparing(key -> bootstrapPeerConnections.acceptedAt(key).orElse(Instant.MAX),
+                                java.util.Comparator.reverseOrder()))
                 .orElse(null);
     }
 
@@ -1120,18 +1326,35 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
      * MldhtService anuncia automaticamente quando recebe um TorrentStartedEvent; como esta
      * runtime nunca cria BtClient, ela é segura para peers outbound-only/firewalled.
      */
-    private synchronized BtRuntime dhtLookupRuntime(boolean ipv6) {
+    private BtRuntime awaitDhtReady(boolean ipv6) {
         if (ipv6 && !connectivity.hasGlobalIpv6()) return null;
-        BtRuntime current = ipv6 ? ipv6DhtLookupRuntime : ipv4DhtLookupRuntime;
-        if (current != null) return current;
+        return (ipv6 ? ipv6DhtLookupLifecycle : ipv4DhtLookupLifecycle).awaitDhtReady();
+    }
 
-        BtRuntime created = BtRuntime.builder(dhtLookupNetworkConfig(ipv6)).disableAutomaticShutdown().autoLoadModules()
-                .module(dhtDiscoveryModule(ipv6)).build();
-        if (ipv6) ipv6DhtLookupRuntime = created;
-        else ipv4DhtLookupRuntime = created;
-        diagnostics.log("DHT LOOKUP " + (ipv6 ? "IPv6" : "IPv4") + " criado: UDP local " + connectivity.dhtListeningPort()
-                + "; modo=descoberta apenas; nenhum infoHash local será anunciado por esta runtime.");
-        return created;
+    private DhtLookupRuntimeLifecycle dhtLookupLifecycle(boolean ipv6) {
+        String family = ipv6 ? "IPv6" : "IPv4";
+        return new DhtLookupRuntimeLifecycle(
+                () -> BtRuntime.builder(dhtLookupNetworkConfig(ipv6)).disableAutomaticShutdown().autoLoadModules()
+                        .module(dhtDiscoveryModule(ipv6)).build(),
+                created -> {
+                    diagnostics.log("[DHT] LOOKUP RUNTIME STARTING: family=" + family + "; udpLocalPort="
+                            + connectivity.dhtListeningPort() + "; mode=DISCOVERY_ONLY.");
+                    DhtLookupRuntimeInitializer.ReadyDhtState state;
+                    try {
+                        state = DhtLookupRuntimeInitializer.startupAndAwait(created);
+                    } catch (RuntimeException error) {
+                        diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "[DHT] startup failed reason=RPC server did not become ready"
+                                + "; timeout=" + created.getConfig().getShutdownHookTimeout().toSeconds() + "s"
+                                + "; retryBackoff=" + dhtLookupRuntimeSettings.dhtRetryBackoff().toSeconds() + "s"
+                                + "; detail=" + message(error));
+                        throw error;
+                    }
+                    diagnostics.log("[DHT] RPC SERVER STARTED: family=" + family + "; runningServers="
+                            + state.runningRpcServers() + ".");
+                    diagnostics.log("[DHT] LOOKUP RUNTIME READY: family=" + family + "; mode=DISCOVERY_ONLY.");
+                    diagnostics.log("[DHT] bootstrap started: family=" + family + "; source=bt-dht.");
+                    diagnostics.log("[DHT] nodes known=" + state.knownNodes() + "; family=" + family + ".");
+                }, () -> dhtLookupRuntimeSettings.dhtRetryBackoff());
     }
 
     private List<Boolean> activeDhtFamilies() {
@@ -1173,9 +1396,18 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         });
         */
     }
-    private void startClient(String operation, String title, String infoHash, BtClient client, Runnable onStarted) {
-        client.startAsync(state -> reportTransferState(operation, infoHash, state), 1_000)
-                .whenComplete((ignored, error) -> { if (error != null) reportFailure(operation, error); });
+    private CompletableFuture<?> startClient(String operation, String title, String infoHash, BtClient client, Runnable onStarted) {
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "CLIENT START REQUESTED: operation=" + operation + "; infoHash=" + infoHash
+                + "; startedBeforeRequest=" + client.isStarted() + ".");
+        CompletableFuture<?> clientFuture = client.startAsync(state -> reportTransferState(operation, infoHash, state), 1_000);
+        clientProcessCompletions.put(client, clientFuture);
+        clientFuture.whenComplete((ignored, error) -> {
+            clientProcessCompletions.remove(client, clientFuture);
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "CLIENT PROCESS COMPLETED: operation=" + operation + "; infoHash=" + infoHash
+                    + "; error=" + (error == null ? "none" : error.getClass().getSimpleName() + ": " + error.getMessage())
+                    + "; startedAtCompletion=" + client.isStarted() + ".");
+            if (error != null) reportFailure(operation, error);
+        });
         Thread.startVirtualThread(() -> {
             try { Thread.sleep(1_000); } catch (InterruptedException error) { Thread.currentThread().interrupt(); return; }
             if (client.isStarted()) {
@@ -1201,9 +1433,11 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             }
             else if (!operation.equals("Swarm Assist")) statusListener.accept(operation + " P2P não iniciou para “" + title + "”.");
         });
+        return clientFuture;
     }
     /** Consulta observável da DHT. Ela apenas registra endpoints; o motor BitTorrent realiza conexões reais. */
     private void requestDhtLookup(String infoHash, String purpose) {
+        if (shuttingDown.get()) return;
         for (boolean ipv6 : activeDhtFamilies()) requestDhtLookup(infoHash, purpose, ipv6);
     }
 
@@ -1222,50 +1456,79 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
 
     /** O mesmo infoHash é consultado em cada sobreposição DHT ativa, sem misturar IPv4 e IPv6. */
     private CompletableFuture<Integer> requestDhtLookup(String infoHash, String purpose, boolean ipv6) {
+        if (shuttingDown.get()) return CompletableFuture.failedFuture(dhtLookupShutdownError());
         CompletableFuture<Integer> completion = new CompletableFuture<>();
-        Thread.startVirtualThread(() -> {
+        Thread worker = Thread.ofVirtual().unstarted(() -> {
             try {
-                BtRuntime active = dhtLookupRuntime(ipv6);
+                if (shuttingDown.get()) throw dhtLookupShutdownError();
+                BtRuntime active = awaitDhtReady(ipv6);
                 if (active == null) {
                     completion.completeExceptionally(new IllegalStateException("DHT " + (ipv6 ? "IPv6" : "IPv4") + " não está ativa"));
                     return;
                 }
+                if (shuttingDown.get()) throw dhtLookupShutdownError();
                 String overlay = ipv6 ? "IPv6" : "IPv4";
-                diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT " + overlay + " LOOKUP START: infoHash=" + infoHash + "; finalidade=" + purpose + ".");
-                diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT nodes known before lookup=" + dhtKnownNodes(active) + "; infoHash=" + infoHash + ".");
+                diagnostics.log("[DHT] LOOKUP START: infoHash=" + infoHash + "; family=" + overlay + "; purpose=" + purpose + ".");
+                diagnostics.log("[DHT] nodes known=" + dhtKnownNodes(active) + "; family=" + overlay + "; phase=before-lookup.");
                 AtomicInteger rawPeers = new AtomicInteger();
                 java.util.Set<String> uniquePeers = ConcurrentHashMap.newKeySet();
                 try (var found = active.service(DHTService.class).getPeers(TorrentId.fromBytes(hexBytes(infoHash)))) {
                     found.limit(32).forEach(peer -> {
+                        if (shuttingDown.get()) throw dhtLookupShutdownError();
                         rawPeers.incrementAndGet();
                         String endpoint = peer.getInetAddress().getHostAddress() + ":" + peer.getPort();
                         if (uniquePeers.add(endpoint)) {
-                            diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT PEER FOUND: infoHash=" + infoHash + "; endpoint=" + endpoint
+                            diagnostics.log("[DHT] PEER DISCOVERED: infoHash=" + infoHash + "; endpoint=" + endpoint
                                     + "; source=" + overlay + "; index=" + uniquePeers.size() + ".");
                             peerConnectivity.onDhtPeerDiscovered(infoHash, peer);
                             if (uniquePeers.size() == 1) reportSwarmAssistActivity(infoHash, SwarmAssistActivity.Type.PEER_SEEN);
                         }
                     });
                 }
-                diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT LOOKUP COMPLETE: finalidade=" + purpose + "; eventos=" + rawPeers.get() + "; peers únicos=" + uniquePeers.size()
-                        + "; nós conhecidos agora=" + dhtKnownNodes(active) + ".");
+                diagnostics.log("[DHT] LOOKUP COMPLETE: infoHash=" + infoHash + "; purpose=" + purpose + "; events=" + rawPeers.get()
+                        + "; uniquePeers=" + uniquePeers.size() + "; nodes known=" + dhtKnownNodes(active) + ".");
                 refreshSwarmAssistStats(infoHash);
                 completion.complete(uniquePeers.size());
             } catch (Exception error) {
-                diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT LOOKUP FAILED: finalidade=" + purpose + "; erro="
-                        + error.getClass().getSimpleName() + " — " + String.valueOf(error.getMessage()));
+                diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "[DHT] " + (shuttingDown.get() ? "LOOKUP CANCELLED" : "LOOKUP FAILED")
+                        + ": finalidade=" + purpose + "; erro=" + error.getClass().getSimpleName() + " — " + String.valueOf(error.getMessage()));
                 // Falha não é observação de swarm vazio. O chamador mantém a
                 // estatística anterior e pode tentar novamente no scheduler.
                 completion.completeExceptionally(error);
+            } finally {
+                pendingDhtLookups.remove(Thread.currentThread());
             }
         });
+        synchronized (dhtLookupShutdownMonitor) {
+            if (shuttingDown.get()) return CompletableFuture.failedFuture(dhtLookupShutdownError());
+            pendingDhtLookups.put(worker, completion);
+            worker.start();
+        }
         return completion;
     }
     private void attachTorrentDiagnostics(String infoHash, String role) {
+        attachTorrentDiagnostics(runtime(), infoHash, role);
+    }
+
+    private void attachTorrentDiagnostics(BtRuntime activeRuntime, String infoHash, String role) {
         torrentDiagnosticRoles.put(infoHash, role);
-        if (!observedTorrents.add(infoHash)) return;
+        String runtimeTorrentKey = System.identityHashCode(activeRuntime) + ":" + infoHash;
+        if (!observedTorrents.add(runtimeTorrentKey)) return;
         TorrentId id = TorrentId.fromBytes(hexBytes(infoHash));
-        var events = runtime().getEventSource();
+        var events = activeRuntime.getEventSource();
+        events.onPeerDiscovered(id, event -> {
+            Peer discovered = event.getPeer();
+            if (discovered == null || discovered.isPortUnknown()) return;
+            // DHT e PEX ja passaram explicitamente pelo Connectivity Manager.
+            // Um endpoint novo neste evento vem da fonte nativa do bt-core
+            // (trackers configurados no magnet), que ja o registrou uma vez
+            // no IPeerRegistry. Apenas registramos a origem, sem uma segunda
+            // promocao/conexao e sem criar outra sessao de download.
+            if (peerConnectivity.isKnownTcpEndpoint(infoHash, discovered)) return;
+            peerConnectivity.onTrackerPeerDiscovered(infoHash, discovered);
+            diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "TRACKER PEER DISCOVERED: infoHash=" + infoHash
+                    + "; peer=" + peer(discovered) + "; origem=TRACKER; encaminhado ao PeerConnectivityManager.");
+        });
         events.onPeerConnected(id, event -> {
             peerConnectivity.onBitTorrentConnectedEvent(infoHash, event.getPeer(), event.getRemotePort());
             enforceAcceptedConnectionBudget(infoHash, event.getPeer(), event.getRemotePort());
@@ -1286,11 +1549,22 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                 logSwarmAssistConnectionState(infoHash, occupied, stats);
             }
         });
-        events.onPeerBitfieldUpdated(id, event -> diagnostics.log(diagnosticRole(infoHash, role) + ": bitfield recebido de " + peer(event.getPeer()) + "; peças disponíveis="
-                + event.getBitfield().getPiecesComplete() + "/" + event.getBitfield().getPiecesTotal() + "."));
+        events.onPeerBitfieldUpdated(id, event -> {
+            bootstrapPeerConnections.markPeerHasPieces(id, event.getPeer(), event.getConnectionKey().getRemotePort(),
+                    event.getBitfield().getPiecesComplete() > 0);
+            diagnostics.log(diagnosticRole(infoHash, role) + ": bitfield recebido de " + peer(event.getPeer()) + "; peças disponíveis="
+                    + event.getBitfield().getPiecesComplete() + "/" + event.getBitfield().getPiecesTotal() + ".");
+        });
         events.onMetadataAvailable(id, event -> diagnostics.log(diagnosticRole(infoHash, role) + ": evento de metadados recebido; torrent=" + event.getTorrent().getName() + "."));
-        events.onPieceVerified(id, event -> diagnostics.log(P2pDiagnostics.Layer.BITTORRENT,
-                "PIECE VERIFIED: role=" + diagnosticRole(infoHash, role) + "; índice=" + event.getPieceIndex() + "."));
+        events.onPieceVerified(id, event -> {
+            int contiguousPrefix = streamingPiecePrefixes.record(infoHash, event.getPieceIndex());
+            diagnostics.log(P2pDiagnostics.Layer.BITTORRENT, "PIECE VERIFIED: role=" + diagnosticRole(infoHash, role)
+                    + "; índice=" + event.getPieceIndex() + ".");
+            if (contiguousPrefix > 0) {
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM PREFIX VERIFIED: infoHash=" + infoHash
+                        + "; contiguousPieces=" + contiguousPrefix + "; lastPiece=" + event.getPieceIndex() + ".");
+            }
+        });
         events.onPeerDisconnected(id, event -> {
             peerConnectivity.onBitTorrentDisconnected(infoHash, event.getPeer(), event.getRemotePort());
             holePunchAgent.onPeerDisconnected(infoHash, event.getPeer(), event.getRemotePort());
@@ -1423,12 +1697,26 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             }
             return;
         }
-        runtime().service(IPeerRegistry.class).addPeer(TorrentId.fromBytes(hexBytes(promotion.infoHash())),
-                InetPeer.build(promotion.endpoint().address(), promotion.endpoint().port()));
+        TorrentId torrentId = TorrentId.fromBytes(hexBytes(promotion.infoHash()));
+        InetPeer peer = InetPeer.build(promotion.endpoint().address(), promotion.endpoint().port());
+        BtRuntime preview = metadataPreviewRuntimes.get(promotion.infoHash());
+        if (preview != null) {
+            try {
+                preview.service(IPeerRegistry.class).addPeer(torrentId, peer);
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM METADATA PEER FORWARDED: infoHash="
+                        + promotion.infoHash() + "; endpoint=" + promotion.endpoint().address().getHostAddress()
+                        + ":" + promotion.endpoint().port() + ".");
+            } catch (RuntimeException error) {
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM METADATA PEER FORWARD FAILED: infoHash="
+                        + promotion.infoHash() + "; reason=" + message(error) + ".");
+            }
+        }
+        runtime().service(IPeerRegistry.class).addPeer(torrentId, peer);
     }
     private void reportTransferState(String operation, String infoHash, bt.torrent.TorrentSessionState state) {
-        if (operation.startsWith("Seed") || operation.equals("Swarm Assist")) return;
-        TransferSnapshot previous = transferSnapshots.put(infoHash, new TransferSnapshot(state.getDownloaded(), state.getPiecesRemaining(), state.getPiecesComplete()));
+        if (operation.startsWith("Seed") || operation.equals("Swarm Assist") || operation.equals("Metadata")) return;
+        TransferSnapshot previous = transferSnapshots.put(infoHash.toLowerCase(), new TransferSnapshot(state.getDownloaded(),
+                state.getPiecesRemaining(), state.getPiecesComplete(), state.getPiecesTotal()));
         if (previous == null || state.getDownloaded() != previous.downloaded()) {
             long delta = previous == null ? state.getDownloaded() : state.getDownloaded() - previous.downloaded();
             diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, operation.toUpperCase() + ": dados recebidos=" + state.getDownloaded() + " bytes (novo=" + Math.max(0, delta)
@@ -1438,7 +1726,11 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             diagnostics.log(P2pDiagnostics.Layer.BITTORRENT, "PIECE/BLOCK REQUEST SCHEDULED: operação=" + operation + "; peças restantes="
                     + state.getPiecesRemaining() + "; peers conectados=" + state.getConnectedPeers().size() + ".");
         }
-        if (state.getPiecesRemaining() == 0 && (previous == null || previous.piecesRemaining() != 0)) {
+        // Um seletor com todos os arquivos em SKIP também informa zero peças restantes.
+        // Isso não é uma transferência concluída: só registrar conclusão com todas as
+        // peças verificadas e os dados realmente recebidos.
+        if (state.getPiecesTotal() > 0 && state.getPiecesComplete() >= state.getPiecesTotal()
+                && state.getDownloaded() > 0 && (previous == null || previous.piecesComplete() < state.getPiecesTotal())) {
             diagnostics.event(P2pDiagnostics.Category.LF_BT_BRIDGE, "PIECE_TRANSFER_CONFIRMED",
                     "torrentId", abbreviatedInfoHash(infoHash), "bytes", state.getDownloaded());
             diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, operation.toUpperCase() + ": todas as peças foram verificadas; aguardando callback de conclusão.");
@@ -1451,14 +1743,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         return peer.getInetAddress().getHostAddress() + (peer.isPortUnknown() ? ":porta desconhecida" : ":" + peer.getPort());
     }
     private int dhtKnownNodes(BtRuntime active) {
-        try {
-            Object service = active.service(DHTService.class);
-            java.lang.reflect.Field field = service.getClass().getDeclaredField("dht");
-            field.setAccessible(true);
-            Object dht = field.get(service);
-            Object node = dht.getClass().getMethod("getNode").invoke(dht);
-            return (Integer) node.getClass().getMethod("getNumEntriesInRoutingTable").invoke(node);
-        } catch (Exception ignored) { return -1; }
+        return DhtLookupRuntimeInitializer.readyState(active).knownNodes();
     }
     private byte[] hexBytes(String infoHash) {
         if (infoHash == null || !infoHash.matches("[0-9a-fA-F]{40}")) throw new IllegalArgumentException("infoHash inválido");
@@ -1500,16 +1785,34 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         else java.util.Optional.ofNullable(preferredIpv4Address()).ifPresent(config::setAcceptorAddress);
         config.setNumOfHashingThreads(Math.max(2, Runtime.getRuntime().availableProcessors()));
         config.setMaxConcurrentlyActivePeerConnectionsPerTorrent(16);
+        applyConnectionLimits(config, connectionLimits());
         // Limite real de retentativas: evita martelar um peer inacessível enquanto preserva a descoberta P2P.
         config.setPeerConnectionRetryInterval(Duration.ofSeconds(30));
         config.setPeerConnectionRetryCount(2);
         return config;
     }
 
+    /** A prévia de metadados usa porta efêmera e não carrega módulos DHT/announce. */
+    private Config metadataPreviewNetworkConfig() {
+        Config config = networkConfig(false);
+        config.setAcceptorPort(0);
+        return config;
+    }
+
+    /** Mantém o limite interno do bt-core alinhado ao orçamento aplicado pelo Luffy. */
+    static void applyConnectionLimits(Config config, ConnectionLimits limits) {
+        if (config == null || limits == null) return;
+        config.setMaxPeerConnections(limits.maxTotalConnections());
+        config.setMaxPeerConnectionsPerTorrent(limits.maxDownloadConnections());
+        config.setMaxPendingConnectionRequests(limits.maxPendingConnections());
+        config.setNumberOfPeersToRequestFromTracker(limits.maxDownloadConnections());
+    }
+
     /** DHT de consulta não recebe torrents e usa porta TCP efêmera para nunca anunciar a porta P2P local. */
     private Config dhtLookupNetworkConfig(boolean ipv6) {
         Config config = networkConfig(ipv6);
         config.setAcceptorPort(0);
+        config.setShutdownHookTimeout(dhtLookupRuntimeSettings.dhtStartupTimeout());
         return config;
     }
     /**
@@ -1543,19 +1846,21 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
     private LuffyDhtDiscoveryModule dhtDiscoveryModule(boolean ipv6) {
         DHTConfig config = new DHTConfig();
-        config.setShouldUseRouterBootstrap(true);
+        DhtBootstrapNodes.configure(config, ipv6);
         config.setListeningPort(connectivity.dhtListeningPort());
         config.setShouldUseIPv6(ipv6);
         return new LuffyDhtDiscoveryModule(config);
     }
     /** Diagnóstico leve: confirma se a rede permite consultas UDP ao bootstrap público do DHT. */
     public void checkDhtReachability() {
+        if (shuttingDown.get()) return;
         for (boolean ipv6 : activeDhtFamilies()) checkDhtReachability(ipv6);
     }
 
     private void checkDhtReachability(boolean ipv6) {
         Thread.startVirtualThread(() -> {
             try {
+                if (shuttingDown.get()) return;
                 java.net.InetAddress destination = bootstrapAddress(ipv6);
                 try (var socket = ipv6
                         ? new java.net.DatagramSocket(new java.net.InetSocketAddress(connectivity.publicIpv6().orElseThrow(), 0))
@@ -1564,7 +1869,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                 byte[] query = "d1:ad2:id20:01234567890123456789e1:q4:ping1:t2:aa1:y1:qe".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
                 socket.send(new java.net.DatagramPacket(query, query.length, new java.net.InetSocketAddress(destination, 6881)));
                 byte[] response = new byte[2_048]; socket.receive(new java.net.DatagramPacket(response, response.length));
-                diagnostics.log("DHT " + (ipv6 ? "IPv6" : "IPv4") + " bootstrap respondeu por UDP; nós conhecidos=" + dhtKnownNodes(dhtLookupRuntime(ipv6)) + ".");
+                diagnostics.log("DHT " + (ipv6 ? "IPv6" : "IPv4") + " bootstrap respondeu por UDP; nós conhecidos=" + dhtKnownNodes(awaitDhtReady(ipv6)) + ".");
                 statusListener.accept("DHT " + (ipv6 ? "IPv6" : "IPv4") + " respondeu ao bootstrap. "
                         + (connectivity.publicPeerEndpoint().isPresent()
                         ? "A descoberta de peers está ativa com rota direta configurada."
@@ -1591,36 +1896,50 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
     private String message(Exception error) { return error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage(); }
     private String toUri(MagnetLink magnet) {
-        String name = magnet.displayName().orElse("video");
-        StringBuilder uri = new StringBuilder("magnet:?xt=urn:btih:").append(magnet.infoHash())
-                .append("&dn=").append(java.net.URLEncoder.encode(name, java.nio.charset.StandardCharsets.UTF_8));
-        // Preserve optional direct peers and trackers carried by a magnet created elsewhere.
-        for (String key : List.of("x.pe", "tr")) {
-            String value = magnet.parameters().get(key);
-            if (value != null && !value.isBlank()) uri.append('&').append(key).append('=').append(java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8));
-        }
-        return uri.toString();
+        return magnet.toUri();
     }
     @Override public void close() {
+        if (!shuttingDown.compareAndSet(false, true)) return;
+        cancelPendingDhtLookups();
+        ipv4DhtLookupLifecycle.stop();
+        ipv6DhtLookupLifecycle.stop();
         rendezvousFallbackCoordinator.close();
         rendezvousExtension.close();
         routeExtension.close();
         bootstrapNeighborManager.close();
         bootstrapSwarmManager.close();
         sessions.values().forEach(BtClient::stop); sessions.clear();
+        metadataPreviewRuntimes.values().forEach(this::shutdownRuntime); metadataPreviewRuntimes.clear();
+        clientProcessCompletions.clear();
         swarmAssistSessions.values().forEach(BtClient::stop); swarmAssistSessions.clear();
         swarmAssistMaintenanceTasks.values().forEach(task -> task.cancel(false)); swarmAssistMaintenanceTasks.clear();
         swarmAssistReplenishTasks.values().forEach(task -> task.cancel(false)); swarmAssistReplenishTasks.clear();
         swarmAssistMaintenance.shutdownNow(); swarmAssistDhtScheduler.close();
-        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear();
+        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear(); streamingPiecePrefixes.clear();
         BtRuntime active = runtime; runtime = null; transferRuntimeDhtAnnounceEnabled = false; if (active != null) active.shutdown();
-        BtRuntime lookup = ipv4DhtLookupRuntime; ipv4DhtLookupRuntime = null; if (lookup != null) lookup.shutdown();
-        BtRuntime lookupIpv6 = ipv6DhtLookupRuntime; ipv6DhtLookupRuntime = null; if (lookupIpv6 != null) lookupIpv6.shutdown();
         BtRuntime activeIpv6 = ipv6Runtime; ipv6Runtime = null; if (activeIpv6 != null) activeIpv6.shutdown();
         utpBridge.close(); utpTransport = null;
         bootstrapPeerConnections.clear();
         peerConnectivity.close();
         temporaryRoots.forEach(this::deleteTemporaryRoot); temporaryRoots.clear();
+    }
+
+    private void cancelPendingDhtLookups() {
+        List<Map.Entry<Thread, CompletableFuture<Integer>>> pending;
+        synchronized (dhtLookupShutdownMonitor) {
+            pending = pendingDhtLookups.entrySet().stream().toList();
+        }
+        if (!pending.isEmpty()) {
+            diagnostics.log(P2pDiagnostics.Layer.DISCOVERY, "DHT shutdown: cancelando " + pending.size() + " consulta(s) pendente(s).");
+        }
+        for (Map.Entry<Thread, CompletableFuture<Integer>> lookup : pending) {
+            lookup.getValue().completeExceptionally(dhtLookupShutdownError());
+            lookup.getKey().interrupt();
+        }
+    }
+
+    private IllegalStateException dhtLookupShutdownError() {
+        return new IllegalStateException("DHT lookup cancelled because Luffy is shutting down");
     }
     private void deleteTemporaryRoot(Path root) {
         try (var paths = java.nio.file.Files.walk(root)) { paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> { try { java.nio.file.Files.deleteIfExists(path); } catch (java.io.IOException ignored) { } }); }
@@ -1628,5 +1947,14 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
     public record DiagnosticTestSource(String magnet, String infoHash, Path sourceFile, P2pDiagnosticScenario scenario) { }
     public record DiagnosticTestResult(Path receivedFile, boolean contentVerified, String content, String outcome, String detail) { }
-    private record TransferSnapshot(long downloaded, int piecesRemaining, int piecesComplete) { }
+    public record StreamingBufferStatus(long downloadedBytes, int verifiedPieces, int contiguousPrefixPieces,
+                                        int totalPieces, int requiredPieces, boolean sessionActive) {
+        private static final int INITIAL_CONTIGUOUS_PIECES = 4;
+        public boolean playable() {
+            return totalPieces > 0 && verifiedPieces >= requiredPieces && contiguousPrefixPieces >= requiredPrefixPieces();
+        }
+        public int requiredPrefixPieces() { return Math.min(INITIAL_CONTIGUOUS_PIECES, Math.max(1, totalPieces)); }
+        static StreamingBufferStatus unavailable() { return new StreamingBufferStatus(0, 0, 0, 0, 12, false); }
+    }
+    private record TransferSnapshot(long downloaded, int piecesRemaining, int piecesComplete, int piecesTotal) { }
 }

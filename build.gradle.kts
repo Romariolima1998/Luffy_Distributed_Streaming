@@ -17,7 +17,7 @@ java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }
 
 javafx {
     version = javafxVersion
-    modules = listOf("javafx.controls", "javafx.graphics", "javafx.media")
+    modules = listOf("javafx.controls", "javafx.graphics", "javafx.media", "javafx.swing")
 }
 
 val linuxJavafx by configurations.creating {
@@ -29,12 +29,18 @@ dependencies {
     implementation("org.xerial:sqlite-jdbc:3.47.1.0")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
     implementation("com.github.atomashpolskiy:bt-core:1.10")
+    // Extensão oficial do bt-core para trackers HTTP/HTTPS; o autoLoadModules()
+    // existente passa a atender magnets públicos que não usam somente UDP.
+    implementation("com.github.atomashpolskiy:bt-http-tracker-client:1.10")
     implementation("com.github.atomashpolskiy:bt-dht:1.10")
     implementation("com.offbynull.portmapper:portmapper:2.0.6")
+    // Decodificador FFmpeg integrado: permite MKV/HEVC sem exigir VLC instalado.
+    implementation("org.bytedeco:javacv:1.5.13")
+    implementation("org.bytedeco:ffmpeg-platform:8.0.1-1.5.13")
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
 
-    listOf("base", "graphics", "controls", "media").forEach { module ->
+    listOf("base", "graphics", "controls", "media", "swing").forEach { module ->
         add(linuxJavafx.name, "org.openjfx:javafx-$module:$javafxVersion:linux") {
             isTransitive = false
         }

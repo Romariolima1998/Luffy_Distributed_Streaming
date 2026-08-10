@@ -98,11 +98,24 @@ public final class ConnectivityService implements AutoCloseable {
         if (!isWindows()) return true;
         try {
             WindowsFirewallManager firewall = new WindowsFirewallManager();
-            if (!requestWindowsFirewall && firewall.isLuffyAllowed(executable, torrentPort, DHT_PORT)) return true;
+            diagnostics.log("[FIREWALL] CHECK: programa=" + executable.toAbsolutePath() + "; TCP=" + torrentPort
+                    + "; UDP/uTP=" + torrentPort + "; UDP/DHT=" + DHT_PORT + ".");
+            if (!requestWindowsFirewall && firewall.isLuffyAllowed(executable, torrentPort, DHT_PORT)) {
+                diagnostics.log("[FIREWALL] READY: regras existentes correspondem ao executável atual.");
+                return true;
+            }
+            diagnostics.log("[FIREWALL] REQUEST: criando regras específicas para o executável atual.");
             statusListener.accept("Solicitando permissao do Windows para o Luffy receber conexoes P2P...");
             boolean allowed = firewall.allowLuffy(executable, torrentPort, DHT_PORT);
+            if (!allowed) {
+                diagnostics.log("[FIREWALL] FAILED: o Windows não confirmou a criação das regras.");
+                statusListener.accept("A regra de firewall não foi confirmada. O Luffy continuará somente com conexões de saída.");
+                return false;
+            }
+            diagnostics.log("[FIREWALL] READY: regras autorizadas para TCP " + torrentPort + ", UDP/uTP "
+                    + torrentPort + " e UDP/DHT " + DHT_PORT + ".");
             statusListener.accept("Firewall do Luffy autorizado para TCP " + torrentPort + ", uTP UDP " + torrentPort + " e DHT UDP " + DHT_PORT + ".");
-            return allowed;
+            return true;
         } catch (Exception error) {
             statusListener.accept("A regra de firewall nao foi criada: " + message(error) + ". O Luffy ainda pode iniciar conexoes de saida.");
             diagnostics.log("FIREWALL ERROR: " + message(error));

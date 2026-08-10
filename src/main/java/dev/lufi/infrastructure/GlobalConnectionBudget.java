@@ -87,6 +87,21 @@ public final class GlobalConnectionBudget {
         return new Snapshot(unique.size(), pending, byRole);
     }
 
+    /**
+     * Fotografia usada somente para decidir se uma conexão já aceita deve ser
+     * encerrada. Tentativas pendentes limitam novas aberturas em {@link
+     * #admit(ConnectionRole, String, Collection)}, mas não podem expulsar um
+     * peer que acabou de completar o handshake.
+     */
+    public Snapshot acceptedSnapshot(Collection<Slot> slots) {
+        if (slots == null || slots.isEmpty()) return snapshot(null);
+        Map<String, Slot> accepted = new HashMap<>();
+        for (Slot slot : slots) {
+            if (slot != null && !slot.pending()) accepted.put(slot.key(), slot);
+        }
+        return snapshot(accepted.values());
+    }
+
     private int countCategory(Snapshot snapshot, ConnectionRole requested) {
         if (requested.isUserTransfer()) return snapshot.count(ConnectionRole.STREAM) + snapshot.count(ConnectionRole.DOWNLOAD);
         if (requested.isOverlayControl()) return snapshot.count(ConnectionRole.RENDEZVOUS) + snapshot.count(ConnectionRole.OVERLAY);

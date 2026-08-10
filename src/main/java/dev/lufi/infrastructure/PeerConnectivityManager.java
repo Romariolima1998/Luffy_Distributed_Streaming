@@ -230,12 +230,25 @@ public final class PeerConnectivityManager implements AutoCloseable {
         onPeerEndpointDiscovered(infoHash, new PeerEndpoint(peer.getInetAddress(), peer.getPort(), Transport.TCP), DiscoveryOrigin.PEX);
     }
 
-    public void onTrackerPeerDiscovered(String infoHash, Peer peer) { onPeerDiscoveredFrom(infoHash, peer, DiscoveryOrigin.TRACKER); }
+    /**
+     * O bt-core ja registrou este peer no seu {@code IPeerRegistry} ao receber
+     * a resposta do tracker. Aqui apenas unificamos a descoberta e a origem no
+     * Connectivity Manager: promover novamente o mesmo endpoint criaria uma
+     * segunda tentativa TCP desnecessaria.
+     */
+    public void onTrackerPeerDiscovered(String infoHash, Peer peer) {
+        onPeerDiscoveredFrom(infoHash, peer, DiscoveryOrigin.TRACKER, false);
+    }
     public void onPeerCachePeerDiscovered(String infoHash, Peer peer) { onPeerDiscoveredFrom(infoHash, peer, DiscoveryOrigin.PEER_CACHE); }
     public void onMagnetMetadataPeerDiscovered(String infoHash, Peer peer) { onPeerDiscoveredFrom(infoHash, peer, DiscoveryOrigin.MAGNET_METADATA); }
     private void onPeerDiscoveredFrom(String infoHash, Peer peer, DiscoveryOrigin origin) {
         if (peer == null || peer.isPortUnknown()) return;
         onPeerEndpointDiscovered(infoHash, new PeerEndpoint(peer.getInetAddress(), peer.getPort(), Transport.TCP), origin);
+    }
+    private void onPeerDiscoveredFrom(String infoHash, Peer peer, DiscoveryOrigin origin, boolean scheduleConnectivityAttempt) {
+        if (peer == null || peer.isPortUnknown()) return;
+        recordPeerEndpoint(infoHash, new PeerEndpoint(peer.getInetAddress(), peer.getPort(), Transport.TCP), origin,
+                scheduleConnectivityAttempt);
     }
 
     /** Armazena qualquer caminho de um peer sem deduplicar outra família ou transporte. */
@@ -245,6 +258,15 @@ public final class PeerConnectivityManager implements AutoCloseable {
 
     /** Armazena o endpoint e a fonte que o apresentou sem misturar descoberta com conexão. */
     public void onPeerEndpointDiscovered(String infoHash, PeerEndpoint endpoint, DiscoveryOrigin origin) {
+        recordPeerEndpoint(infoHash, endpoint, origin, true);
+    }
+
+    /**
+     * Registra uma descoberta de qualquer fonte. Somente fontes externas ao
+     * bt-core (DHT, PEX e hints do magnet) pedem uma promocao explicita; o
+     * tracker ja foi entregue ao registro interno do motor antes deste ponto.
+     */
+    private void recordPeerEndpoint(String infoHash, PeerEndpoint endpoint, DiscoveryOrigin origin, boolean scheduleConnectivityAttempt) {
         validateInfoHash(infoHash);
         origin = origin == null ? DiscoveryOrigin.UNKNOWN : origin;
         peerEndpointObserver.observed(infoHash, endpoint);
@@ -264,6 +286,22 @@ public final class PeerConnectivityManager implements AutoCloseable {
                 diagnostics.log("PEER ORIGIN RECORDED: infoHash=" + infoHash + "; peer=" + endpoint.display() + "; origem=" + discoveryOrigin + ".");
             }
             if (state.connection == ConnectionState.CONNECTED) return;
+            if (!scheduleConnectivityAttempt) {
+                // O PeerDiscoveredEvent do bt-core e disparado antes de sua
+                // propria conexao TCP. Conservamos qualquer tentativa DHT/PEX
+                // que ja esteja pendente e, para um peer novo, apenas deixamos
+                // o lifecycle observar a conexao nativa do tracker.
+                if (state.connection == ConnectionState.DISCOVERED) {
+                    state.strategy = explicitLanPeerHint ? Strategy.DIRECT_IPV4 : chooseStrategy(endpoint);
+                    if (state.strategy == Strategy.NONE) {
+                        state.connection = ConnectionState.UNREACHABLE;
+                        state.failureReason = unreachableReason(endpoint);
+                    } else {
+                        state.failureReason = "peer informado por tracker; aguardando conexao TCP nativa do bt-core";
+                    }
+                }
+                return;
+            }
             state.strategy = explicitLanPeerHint ? Strategy.DIRECT_IPV4 : chooseStrategy(endpoint);
             if (state.strategy == Strategy.NONE) {
                 state.connection = ConnectionState.UNREACHABLE;
@@ -678,6 +716,12 @@ public final class PeerConnectivityManager implements AutoCloseable {
     /** Retorna todos os caminhos preservados, inclusive IPv6/uTP ainda sem motor ativo. */
     public List<PeerEndpoint> endpointsFor(String infoHash) {
         return peersFor(infoHash).stream().map(PeerState::endpoint).toList();
+    }
+
+    /** Usado pelo observador de tracker para nao reclassificar uma descoberta DHT/PEX ja registrada. */
+    public boolean isKnownTcpEndpoint(String infoHash, Peer peer) {
+        if (infoHash == null || peer == null || peer.isPortUnknown()) return false;
+        return peers.containsKey(key(infoHash, new PeerEndpoint(peer.getInetAddress(), peer.getPort(), Transport.TCP)));
     }
 
     private void armConnectionTimer(Promotion promotion) {

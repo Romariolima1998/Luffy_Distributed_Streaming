@@ -70,6 +70,19 @@ class GlobalConnectionBudgetTest {
         assertEquals(GlobalConnectionBudget.AdmissionReason.ALREADY_ACCOUNTED, decision.reason());
     }
 
+    @Test void pendingAttemptsDoNotCauseAnAcceptedPeerToBeClosed() {
+        GlobalConnectionBudget budget = budget(new ConnectionLimits(3, 8, 2, 4, 8, 16));
+        List<GlobalConnectionBudget.Slot> slots = List.of(
+                slot("accepted-download", ConnectionRole.DOWNLOAD),
+                pending("pending-download-1", ConnectionRole.DOWNLOAD),
+                pending("pending-download-2", ConnectionRole.DOWNLOAD),
+                pending("pending-download-3", ConnectionRole.DOWNLOAD));
+
+        assertEquals(4, budget.snapshot(slots).count(ConnectionRole.DOWNLOAD));
+        assertEquals(1, budget.acceptedSnapshot(slots).count(ConnectionRole.DOWNLOAD));
+        assertEquals(0, budget.acceptedSnapshot(slots).pending());
+    }
+
     private static GlobalConnectionBudget budget(ConnectionLimits limits) {
         GlobalConnectionBudget budget = new GlobalConnectionBudget();
         budget.setLimits(limits);

@@ -37,6 +37,8 @@ import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.Clipboard;
 import javafx.scene.input.ClipboardContent;
+import javafx.scene.image.Image;
+import javafx.scene.image.ImageView;
 import javafx.scene.layout.*;
 import javafx.scene.media.Media;
 import javafx.scene.media.MediaPlayer;
@@ -52,6 +54,7 @@ import java.nio.charset.StandardCharsets;
 import java.net.URLEncoder;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Ponto de entrada da aplicação desktop. Operações de I/O são executadas fora da thread JavaFX. */
 public final class LufiApplication extends Application {
@@ -95,18 +98,28 @@ public final class LufiApplication extends Application {
     private final Label libraryTitle = new Label("Selecione uma biblioteca");
     private final ListView<WatchEntry> watchPlaylist = new ListView<>();
     private final MediaView mediaView = new MediaView();
+    /** Superficie usada pelo decodificador FFmpeg para MKV/HEVC e demais containers nao suportados pelo JavaFX. */
+    private final ImageView ffmpegView = new ImageView();
     private final StackPane playerSurface = new StackPane();
     private final VBox playerPlaceholder = new VBox();
     private final Label nowPlaying = new Label("Abra um vídeo da sua biblioteca ou um magnet link.");
     private TabPane tabs;
     private MediaPlayer mediaPlayer;
+    private FfmpegMediaPlayer ffmpegPlayer;
+    private double playbackVolume = .8d;
+    private final AtomicLong playbackGeneration = new AtomicLong();
     private WatchContext watchContext;
     private String pendingWatchPath;
+    private String activeWatchInfoHash;
+    private String selectedStreamingPath;
+    /** Cancela a espera de buffer anterior quando o usuário escolhe outro vídeo. */
+    private final AtomicLong streamingRequest = new AtomicLong();
     private final PauseTransition hideControls = new PauseTransition(Duration.seconds(4));
     private HBox playerControls;
     private Stage primaryStage;
     private Stage fullscreenPlayerStage;
     private MediaView fullscreenMediaView;
+    private ImageView fullscreenFfmpegView;
     private HBox fullscreenControls;
 
     @Override public void start(Stage stage) {
@@ -184,6 +197,8 @@ public final class LufiApplication extends Application {
         playerControls.getStyleClass().add("player-controls");
         playerPlaceholder.getChildren().setAll(nowPlaying); playerPlaceholder.setAlignment(Pos.CENTER);
         mediaView.setPreserveRatio(true); mediaView.fitWidthProperty().bind(playerSurface.widthProperty()); mediaView.fitHeightProperty().bind(playerSurface.heightProperty());
+        ffmpegView.setPreserveRatio(true); ffmpegView.fitWidthProperty().bind(playerSurface.widthProperty()); ffmpegView.fitHeightProperty().bind(playerSurface.heightProperty());
+        ffmpegView.setVisible(false);
         StackPane.setAlignment(playerControls, Pos.BOTTOM_CENTER); StackPane.setMargin(playerControls, new Insets(16));
         hideControls.setOnFinished(e -> {
             HBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
@@ -191,7 +206,7 @@ public final class LufiApplication extends Application {
         });
         playerSurface.setOnMouseMoved(e -> revealControls());
         playerSurface.setOnMouseEntered(e -> revealControls());
-        playerSurface.getChildren().setAll(mediaView, playerPlaceholder, playerControls); playerSurface.getStyleClass().add("player"); playerSurface.setMinHeight(260); return playerSurface;
+        playerSurface.getChildren().setAll(mediaView, ffmpegView, playerPlaceholder, playerControls); playerSurface.getStyleClass().add("player"); playerSurface.setMinHeight(260); return playerSurface;
     }
     private void revealControls() {
         HBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
@@ -199,10 +214,10 @@ public final class LufiApplication extends Application {
         active.setVisible(true); hideControls.playFromStart();
     }
     private HBox createPlayerControls(boolean fullscreen) {
-        Button play = new Button("Play"); play.setOnAction(e -> { if (mediaPlayer != null) { torrents.setForegroundPlaybackActive(true); mediaPlayer.play(); } });
-        Button pause = new Button("Pausar"); pause.setOnAction(e -> { if (mediaPlayer != null) mediaPlayer.pause(); });
-        Button stop = new Button("Parar"); stop.setOnAction(e -> { if (mediaPlayer != null) mediaPlayer.stop(); torrents.setForegroundPlaybackActive(false); });
-        Slider volume = new Slider(0, 1, mediaPlayer == null ? .8 : mediaPlayer.getVolume()); volume.setPrefWidth(130); volume.valueProperty().addListener((observable, oldValue, value) -> { if (mediaPlayer != null) mediaPlayer.setVolume(value.doubleValue()); });
+        Button play = new Button("Play"); play.setOnAction(e -> resumePlayback());
+        Button pause = new Button("Pausar"); pause.setOnAction(e -> pausePlayback());
+        Button stop = new Button("Parar"); stop.setOnAction(e -> stopPlayback());
+        Slider volume = new Slider(0, 1, playbackVolume); volume.setPrefWidth(130); volume.valueProperty().addListener((observable, oldValue, value) -> setPlaybackVolume(value.doubleValue()));
         HBox controls = new HBox(10, play, pause, stop, new Label("Volume"), volume);
         Button display = new Button(fullscreen ? "Minimizar" : "Tela cheia");
         display.setOnAction(e -> {
@@ -215,9 +230,19 @@ public final class LufiApplication extends Application {
     private void togglePlayerFullscreen() {
         if (fullscreenPlayerStage != null) { fullscreenPlayerStage.close(); return; }
         fullscreenPlayerStage = new Stage(StageStyle.UNDECORATED); fullscreenPlayerStage.initOwner(primaryStage);
-        fullscreenMediaView = new MediaView(mediaPlayer); fullscreenMediaView.setPreserveRatio(true); fullscreenMediaView.setMouseTransparent(true);
-        StackPane video = new StackPane(fullscreenMediaView); video.setStyle("-fx-background-color: black;");
-        fullscreenMediaView.fitWidthProperty().bind(video.widthProperty()); fullscreenMediaView.fitHeightProperty().bind(video.heightProperty());
+        boolean ffmpegActive = ffmpegPlayer != null;
+        javafx.scene.Node activeVideo;
+        if (ffmpegActive) {
+            fullscreenFfmpegView = new ImageView(ffmpegView.getImage());
+            fullscreenFfmpegView.setPreserveRatio(true); fullscreenFfmpegView.setMouseTransparent(true);
+            activeVideo = fullscreenFfmpegView;
+        } else {
+            fullscreenMediaView = new MediaView(mediaPlayer); fullscreenMediaView.setPreserveRatio(true); fullscreenMediaView.setMouseTransparent(true);
+            activeVideo = fullscreenMediaView;
+        }
+        StackPane video = new StackPane(activeVideo); video.setStyle("-fx-background-color: black;");
+        if (fullscreenFfmpegView != null) { fullscreenFfmpegView.fitWidthProperty().bind(video.widthProperty()); fullscreenFfmpegView.fitHeightProperty().bind(video.heightProperty()); }
+        if (fullscreenMediaView != null) { fullscreenMediaView.fitWidthProperty().bind(video.widthProperty()); fullscreenMediaView.fitHeightProperty().bind(video.heightProperty()); }
         fullscreenControls = createPlayerControls(true); StackPane.setAlignment(fullscreenControls, Pos.BOTTOM_CENTER); StackPane.setMargin(fullscreenControls, new Insets(18)); video.getChildren().add(fullscreenControls);
         Scene scene = new Scene(video, 960, 540);
         scene.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
@@ -225,13 +250,14 @@ public final class LufiApplication extends Application {
         });
         fullscreenPlayerStage.setScene(scene); fullscreenPlayerStage.setOnHidden(e -> restoreEmbeddedPlayer());
         video.addEventFilter(MouseEvent.MOUSE_MOVED, e -> revealControls()); video.addEventFilter(MouseEvent.MOUSE_ENTERED, e -> revealControls());
-        mediaView.setVisible(false); fullscreenPlayerStage.show(); fullscreenPlayerStage.setFullScreen(true); revealControls();
+        mediaView.setVisible(false); ffmpegView.setVisible(false); fullscreenPlayerStage.show(); fullscreenPlayerStage.setFullScreen(true); revealControls();
     }
     private void minimizePlayer() {
         if (fullscreenPlayerStage != null) fullscreenPlayerStage.close();
     }
     private void restoreEmbeddedPlayer() {
-        fullscreenPlayerStage = null; fullscreenMediaView = null; fullscreenControls = null; mediaView.setVisible(true); revealControls();
+        fullscreenPlayerStage = null; fullscreenMediaView = null; fullscreenFfmpegView = null; fullscreenControls = null;
+        mediaView.setVisible(ffmpegPlayer == null); ffmpegView.setVisible(ffmpegPlayer != null); revealControls();
     }
     private Tab libraryTab() {
         Button add = new Button("Adicionar biblioteca"); add.setOnAction(e -> selectLibrary());
@@ -438,6 +464,10 @@ public final class LufiApplication extends Application {
             if (mode == WatchMode.TEMPORARY) swarmAssistManager.recordUserInteraction(magnet.infoHash());
             if (mode == WatchMode.SHARE) removeWatchOnlySwarm(magnet.infoHash());
             watchContext = new WatchContext(raw.trim(), mode);
+            activeWatchInfoHash = magnet.infoHash();
+            pendingWatchPath = null;
+            selectedStreamingPath = null;
+            streamingRequest.incrementAndGet();
             List<String> manifest = LuffyManifest.decode(magnet);
             if (mode == WatchMode.TEMPORARY && !manifest.isEmpty()) {
                 watchPlaylist.getItems().setAll(manifest.stream().map(path -> new WatchEntry(Path.of(path).getFileName().toString(), path, null)).toList());
@@ -466,7 +496,12 @@ public final class LufiApplication extends Application {
         if (entries.isEmpty()) loadWatchPlaylist(content.folder());
         else {
             status.setText("Lista da pasta recebida. Clique duas vezes em um vídeo para assistir enquanto ele é baixado.");
-            if (pendingWatchPath != null) entries.stream().filter(entry -> entry.relativePath().equals(pendingWatchPath)).findFirst().ifPresent(this::openWatchEntry);
+            if (pendingWatchPath != null) {
+                String requestedPath = pendingWatchPath;
+                pendingWatchPath = null;
+                entries.stream().filter(entry -> entry.relativePath().equals(requestedPath)).findFirst()
+                        .ifPresent(entry -> playStreaming(new FoundVideo(entry.name(), entry.path())));
+            }
         }
     }
     private void loadWatchPlaylist(Path folder) {
@@ -490,9 +525,18 @@ public final class LufiApplication extends Application {
         return List.of(".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".mts", ".wmv", ".flv", ".3gp", ".ogv", ".vob", ".asf").stream().anyMatch(name::endsWith);
     }
     private void openWatchEntry(WatchEntry entry) {
-        if (entry.path() != null) { playStreaming(new FoundVideo(entry.name(), entry.path())); return; }
         if (watchContext == null) { status.setText("Cole um magnet antes de escolher um vídeo."); return; }
+        if (watchContext.mode() == WatchMode.SHARE) {
+            if (entry.path() != null) playStreaming(new FoundVideo(entry.name(), entry.path()));
+            return;
+        }
+        if (entry.relativePath().equals(selectedStreamingPath) && entry.path() != null) {
+            playStreaming(new FoundVideo(entry.name(), entry.path()));
+            return;
+        }
+        selectedStreamingPath = entry.relativePath();
         pendingWatchPath = entry.relativePath();
+        streamingRequest.incrementAndGet();
         status.setText("Buscando peers para o vídeo selecionado. Apenas este arquivo será recebido temporariamente.");
         try { watchVideo.execute(watchContext.magnet(), watchContext.mode(), entry.relativePath(), content -> Platform.runLater(() -> onTorrentMetadata(content, watchContext.magnet(), watchContext.mode()))); }
         catch (IllegalArgumentException error) { status.setText(error.getMessage()); }
@@ -625,8 +669,13 @@ public final class LufiApplication extends Application {
     }
     private Scene scene(javafx.scene.Parent root) { Scene scene = new Scene(root); scene.getStylesheets().add(getClass().getResource("/lufi.css").toExternalForm()); return scene; }
     private void playLocal(FoundVideo video) {
+        long generation = resetPlayback();
+        if (FfmpegPlaybackSupport.isRequiredFor(video.path())) {
+            playWithFfmpeg(video, generation);
+            return;
+        }
         try {
-            if (mediaPlayer != null) mediaPlayer.dispose();
+            mediaView.setVisible(true); ffmpegView.setVisible(false);
             Media media = new Media(video.path().toUri().toString());
             media.setOnError(() -> { torrents.setForegroundPlaybackActive(false); status.setText("Formato ou codec não suportado: " + video.name() + ". Tente um MP4 com H.264/AAC."); });
             mediaPlayer = new MediaPlayer(media);
@@ -639,22 +688,149 @@ public final class LufiApplication extends Application {
             status.setText("Carregando “" + video.name() + "”…");
         } catch (RuntimeException error) { torrents.setForegroundPlaybackActive(false); playerPlaceholder.setVisible(true); status.setText("Não foi possível abrir este vídeo: " + error.getMessage()); }
     }
+    private void playWithFfmpeg(FoundVideo video, long generation) {
+        playerPlaceholder.setVisible(true);
+        mediaView.setVisible(false); ffmpegView.setVisible(true); ffmpegView.setImage(null);
+        FfmpegMediaPlayer created = new FfmpegMediaPlayer(video.path(), new FfmpegMediaPlayer.Listener() {
+            @Override public void onReady() {
+                if (!isCurrentFfmpegPlayback(generation)) return;
+                playerPlaceholder.setVisible(false);
+                nowPlaying.setText("Reproduzindo: " + video.name() + " (MKV/FFmpeg)");
+                torrents.setForegroundPlaybackActive(true);
+            }
+
+            @Override public void onFrame(Image image) {
+                if (!isCurrentFfmpegPlayback(generation)) return;
+                ffmpegView.setImage(image);
+                if (fullscreenFfmpegView != null) fullscreenFfmpegView.setImage(image);
+            }
+
+            @Override public void onFinished() {
+                if (isCurrentFfmpegPlayback(generation)) torrents.setForegroundPlaybackActive(false);
+            }
+
+            @Override public void onFailure(Throwable error) {
+                if (!isCurrentFfmpegPlayback(generation)) return;
+                torrents.setForegroundPlaybackActive(false); playerPlaceholder.setVisible(true);
+                status.setText("Não foi possível decodificar o MKV: " + conciseMediaError(error));
+            }
+        });
+        ffmpegPlayer = created;
+        created.setVolume(playbackVolume);
+        tabs.getSelectionModel().select(0);
+        status.setText("Carregando MKV com o decodificador integrado…");
+        created.start();
+    }
+
+    private long resetPlayback() {
+        long generation = playbackGeneration.incrementAndGet();
+        torrents.setForegroundPlaybackActive(false);
+        if (mediaPlayer != null) {
+            mediaPlayer.dispose();
+            mediaPlayer = null;
+        }
+        if (ffmpegPlayer != null) {
+            ffmpegPlayer.close();
+            ffmpegPlayer = null;
+        }
+        mediaView.setMediaPlayer(null);
+        ffmpegView.setImage(null);
+        return generation;
+    }
+
+    private boolean isCurrentFfmpegPlayback(long generation) {
+        return playbackGeneration.get() == generation && ffmpegPlayer != null;
+    }
+
+    private void resumePlayback() {
+        if (ffmpegPlayer != null) {
+            ffmpegPlayer.play();
+            torrents.setForegroundPlaybackActive(true);
+        } else if (mediaPlayer != null) {
+            mediaPlayer.play();
+            torrents.setForegroundPlaybackActive(true);
+        }
+    }
+
+    private void pausePlayback() {
+        if (ffmpegPlayer != null) ffmpegPlayer.pause();
+        else if (mediaPlayer != null) mediaPlayer.pause();
+    }
+
+    private void stopPlayback() {
+        if (ffmpegPlayer != null) ffmpegPlayer.stop();
+        else if (mediaPlayer != null) mediaPlayer.stop();
+        torrents.setForegroundPlaybackActive(false);
+    }
+
+    private void setPlaybackVolume(double volume) {
+        playbackVolume = Math.max(0d, Math.min(1d, volume));
+        if (ffmpegPlayer != null) ffmpegPlayer.setVolume(playbackVolume);
+        if (mediaPlayer != null) mediaPlayer.setVolume(playbackVolume);
+    }
+
+    private static String conciseMediaError(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.isBlank()) return error.getClass().getSimpleName();
+        return message.length() <= 120 ? message : message.substring(0, 117) + "...";
+    }
+
     private void playStreaming(FoundVideo video) {
-        if (Files.isRegularFile(video.path())) { playLocal(video); return; }
-        status.setText("Aguardando os primeiros chunks de “" + video.name() + "”…");
+        String infoHash = activeWatchInfoHash;
+        if (infoHash == null || infoHash.isBlank()) { playLocal(video); return; }
+        long requestId = streamingRequest.incrementAndGet();
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER WAIT START: requestId=" + requestId + "; infoHash="
+                + infoHash + "; video=\"" + video.name() + "\"; path=" + video.path() + ".");
+        status.setText("Preparando o buffer de “" + video.name() + "”…");
         Thread.startVirtualThread(() -> {
             try {
-                for (int attempt = 0; attempt < 60; attempt++) {
-                    if (Files.isRegularFile(video.path()) && Files.size(video.path()) > 0) {
-                        Platform.runLater(() -> playLocal(video)); return;
+                int lastVerifiedPieces = -1;
+                while (streamingRequest.get() == requestId) {
+                    BtTorrentGateway.StreamingBufferStatus buffer = torrents.streamingBufferStatus(infoHash);
+                    if (buffer.playable() && Files.isRegularFile(video.path()) && Files.size(video.path()) > 0) {
+                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER READY: requestId=" + requestId + "; infoHash="
+                                + infoHash + "; downloadedBytes=" + buffer.downloadedBytes() + "; pieces="
+                                + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
+                                + buffer.contiguousPrefixPieces() + "; fileBytes=" + Files.size(video.path()) + ".");
+                        Platform.runLater(() -> {
+                            if (streamingRequest.get() == requestId) playLocal(video);
+                        });
+                        return;
+                    }
+                    if (!buffer.sessionActive()) {
+                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER ABORT: requestId=" + requestId + "; infoHash="
+                                + infoHash + "; reason=session-inactive; downloadedBytes=" + buffer.downloadedBytes()
+                                + "; pieces=" + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
+                                + buffer.contiguousPrefixPieces() + "; fileExists="
+                                + Files.exists(video.path()) + ".");
+                        Platform.runLater(() -> {
+                            if (streamingRequest.get() == requestId) status.setText("A sessão de streaming foi encerrada antes de receber o buffer inicial.");
+                        });
+                        return;
+                    }
+                    if (buffer.verifiedPieces() != lastVerifiedPieces) {
+                        lastVerifiedPieces = buffer.verifiedPieces();
+                        int verified = buffer.verifiedPieces();
+                        int required = buffer.requiredPieces();
+                        long fileBytes = Files.isRegularFile(video.path()) ? Files.size(video.path()) : 0;
+                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER PROGRESS: requestId=" + requestId + "; infoHash="
+                                + infoHash + "; downloadedBytes=" + buffer.downloadedBytes() + "; fileBytes=" + fileBytes
+                                + "; pieces=" + verified + "/" + buffer.totalPieces() + "; prefixPieces="
+                                + buffer.contiguousPrefixPieces() + "; required=" + required
+                                + "; sessionActive=" + buffer.sessionActive() + ".");
+                        Platform.runLater(() -> {
+                            if (streamingRequest.get() == requestId) status.setText("Buffering de “" + video.name() + "”: "
+                                    + verified + "/" + required + " chunks verificados; início contínuo="
+                                    + buffer.contiguousPrefixPieces() + "/" + buffer.requiredPrefixPieces()
+                                    + "; aguardando peers com dados.");
+                        });
                     }
                     Thread.sleep(1_000);
                 }
-                Platform.runLater(() -> status.setText("Ainda não há chunks suficientes para iniciar este vídeo."));
             } catch (Exception error) { Platform.runLater(() -> status.setText("Não foi possível preparar o streaming deste vídeo.")); }
         });
     }
-    @Override public void stop() { swarmAssistManager.close(); torrents.setForegroundPlaybackActive(false); if (mediaPlayer != null) mediaPlayer.dispose(); connectivity.close(); torrents.close(); Platform.exit(); }
+    @Override public void stop() { swarmAssistManager.close(); resetPlayback(); connectivity.close(); torrents.close(); Platform.exit(); }
     private record FoundVideo(String name, Path path) { @Override public String toString() { return name; } }
     private record WatchEntry(String name, String relativePath, Path path) { @Override public String toString() { return name; } }
     private record WatchContext(String magnet, WatchMode mode) { }

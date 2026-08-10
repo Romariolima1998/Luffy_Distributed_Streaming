@@ -246,13 +246,32 @@ class PeerConnectivityManagerTest {
         try (PeerConnectivityManager manager = new PeerConnectivityManager(new P2pDiagnostics(), ignored -> { })) {
             var peer = InetPeer.build(InetAddress.getByName("203.0.113.50"), 6891);
 
+            manager.onTrackerPeerDiscovered(INFO_HASH, peer);
             manager.onPexPeerDiscovered(INFO_HASH, peer);
             manager.onDhtPeerDiscovered(INFO_HASH, peer);
 
             assertEquals(1, manager.peersFor(INFO_HASH).size());
             var origins = manager.peersFor(INFO_HASH).getFirst().origins();
+            assertTrue(origins.contains(PeerConnectivityManager.DiscoveryOrigin.TRACKER));
             assertTrue(origins.contains(PeerConnectivityManager.DiscoveryOrigin.PEX));
             assertTrue(origins.contains(PeerConnectivityManager.DiscoveryOrigin.DHT));
+        }
+    }
+
+    @Test void trackerObservationDoesNotPromoteThePeerAgainButDhtCanPromoteTheSameEndpoint() throws Exception {
+        List<PeerConnectivityManager.Promotion> promotions = new ArrayList<>();
+        try (PeerConnectivityManager manager = new PeerConnectivityManager(new P2pDiagnostics(), promotions::add)) {
+            var peer = InetPeer.build(InetAddress.getByName("203.0.113.51"), 6891);
+
+            manager.onTrackerPeerDiscovered(INFO_HASH, peer);
+            Thread.sleep(150);
+            assertTrue(promotions.isEmpty(), "o tracker ja entregou o peer ao IPeerRegistry do bt-core");
+
+            manager.onDhtPeerDiscovered(INFO_HASH, peer);
+            Thread.sleep(150);
+
+            assertEquals(1, promotions.size(), "o mesmo endpoint continua tendo uma unica promocao gerenciada");
+            assertEquals(1, manager.peersFor(INFO_HASH).size());
         }
     }
 

@@ -2,7 +2,1129 @@
 
 ## Etapa atual
 
-Etapa 1 - Prova BitTorrent real sobre uTP (**revalidada em 4 de agosto de 2026**).
+Etapa 20 - Teste com magnet publico legal - concluida.
+
+## Registro: Etapa 20 - Magnet publico legal
+
+### Objetivo
+
+Validar a interoperabilidade BitTorrent publica sem depender de extensoes
+Luffy. O teste usa o torrent oficial do Ubuntu 24.04.4, gera um magnet a
+partir do metainfo oficial e encerra imediatamente depois da primeira piece
+validada; a imagem ISO inteira nao e baixada.
+
+### Arquivos alterados
+
+- `build.gradle.kts`
+- `src/test/java/dev/lufi/infrastructure/HttpTrackerCompatibilityIntegrationTest.java`
+- `src/test/java/dev/lufi/infrastructure/StandardBitTorrentPeerCompatibilityIntegrationTest.java`
+- `src/integrationTest/java/dev/lufi/infrastructure/OfficialUbuntuPublicMagnetTransferIT.java`
+- `docs/protocol-compatibility.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Foi adicionada somente a extensao oficial
+  `com.github.atomashpolskiy:bt-http-tracker-client:1.10`. Ela e descoberta
+  por `autoLoadModules()` e habilita `http` e `https` sem cliente tracker
+  criado pelo Luffy.
+- A DHT de lookup continua separada e somente de descoberta. Os peers que ela
+  retorna sao entregues ao mesmo `PeerConnectivityManager` e `IPeerRegistry`
+  usados pela sessao BitTorrent normal.
+- Nenhuma classe de `lf_route`, `lf_rendezvous`, Swarm Assist, identidade,
+  BEP 55 ou politica de vizinhos foi alterada.
+
+### Testes executados
+
+```text
+gradle --no-daemon test --tests dev.lufi.infrastructure.HttpTrackerCompatibilityIntegrationTest
+LUFFY_REAL_NETWORK_TESTS=true LUFFY_LEGAL_PUBLIC_MAGNET_TESTS=true \
+  gradle --no-daemon integrationTest --tests dev.lufi.infrastructure.OfficialUbuntuPublicMagnetTransferIT
+```
+
+### Resultado
+
+O teste local de tracker HTTP foi aprovado: announce, porta TCP configurada,
+resposta compacta e peer `TRACKER` chegaram ao fluxo normal.
+
+O teste local de peer BitTorrent padrao tambem foi estabilizado: ele agora
+espera ambas as runtimes registrarem o torrent e inicia a conexao TCP pelo
+`IConnectionSource`, exatamente como os demais testes de transferencia. Isso
+nao altera o motor nem as extensoes Luffy.
+
+O teste publico legal aprovado registrou:
+
+```text
+MAGNET PARSED: TRACKERS=2
+DHT READY: rpcServers=1
+DHT NODES=0 no instante da inicializacao
+DHT PEERS=64
+TRACKER ANNOUNCE START: trackers=2
+PEER CONNECT START: TCP
+PEER CONNECTED
+BITTORRENT HANDSHAKE ACCEPTED
+METADATA RECEIVED
+PIECE REQUEST
+PIECE RECEIVED: index=0
+TRACKER PEERS=0
+PEX PEERS=0
+```
+
+Logo, o download real ocorreu por DHT e TCP padrao, com metadata e piece
+validadas pelo bt-core. Os trackers oficiais nao devolveram peers nesta
+execucao; isso ficou registrado como resultado de fonte complementar, nao foi
+substituido por extensoes Luffy. Uma tentativa anterior tambem observou a
+variacao normal da rede publica, com DHT e tracker retornando zero peers.
+
+A suite normal completa foi aprovada: **257 testes**, 257 aprovados, 0
+falhando e 0 ignorados.
+
+### Proxima etapa
+
+Continuar apenas quando houver uma nova instrucao explicita do usuario.
+
+---
+
+## Registro: Etapa 19 - Teste controlado com µTorrent/qBittorrent
+
+### Objetivo
+
+Validar entre redes reais que o Luffy baixa `teste-publico.txt` semeado por um
+cliente BitTorrent padrao, usando somente magnet, DHT/tracker, handshake,
+metadata e pieces do protocolo BitTorrent.
+
+### Arquivos alterados
+
+- `src/integrationTest/java/dev/lufi/integration/RealNetworkStandardClientCompatibilityIT.java`
+- `src/integrationTest/java/dev/lufi/integration/RealNetworkPublicMagnetDiscoveryIT.java`
+- `src/integrationTest/java/dev/lufi/integration/RealNetworkDiagnosticTransferIT.java`
+- `docs/overlay-implementation-progress.md`
+
+### Como executar
+
+1. Na maquina B, crie `teste-publico.txt` com o conteudo exato `OLA LUFFY
+   PUBLICO`, gere o torrent no qBittorrent/µTorrent e mantenha o seeding.
+2. Copie o magnet gerado e, na maquina A com somente o Luffy, execute:
+
+```text
+$env:LUFFY_REAL_NETWORK_TESTS = "true"
+$env:LUFFY_STANDARD_CLIENT_MAGNET = "magnet:?xt=urn:btih:..."
+.\gradlew.bat --no-daemon integrationTest --tests dev.lufi.integration.RealNetworkStandardClientCompatibilityIT
+```
+
+### Verificacoes do teste
+
+- magnet valido e sem extensoes Luffy obrigatorias;
+- peer descoberto por DHT ou tracker;
+- handshake BitTorrent padrao e metadata;
+- piece verificada e conteudo final exato;
+- nenhuma busca `lf_route` ou sessao `lf_rendezvous`.
+
+### Sondagem publica complementar
+
+O magnet publico fornecido pelo usuario possui 20 trackers UDP, mas nao e o
+arquivo controlado `teste-publico.txt`; portanto ele nao pode validar o
+conteudo final da Etapa 19. Foi executada uma sondagem separada em
+`RealNetworkPublicMagnetDiscoveryIT`, com todos os arquivos em prioridade
+`SKIP`: um tracker UDP publico devolveu uma lista compacta de peers para o
+infoHash e o peer entrou no `PeerConnectivityManager` com origem `TRACKER`.
+O teste concluiu em 6 segundos, sem solicitar pieces nem baixar o video.
+
+### Resultado
+
+O teste controlado de transferencia continua preparado, mas ainda nao pode ser
+executado contra µTorrent/qBittorrent: nao ha cliente padrao instalado nesta
+maquina nem magnet de uma maquina B semeando `teste-publico.txt`. A execucao
+real depende desses dois dados.
+
+### Proxima etapa
+
+Receber o magnet gerado pelo cliente padrao e executar o teste entre as duas
+maquinas.
+
+---
+
+## Registro: Etapa 18 - Compatibilidade com trackers UDP
+
+### Objetivo
+
+Comprovar que um magnet publico com `tr=udp://...` preserva trackers repetidos,
+executa announce UDP, interpreta a resposta compacta de peers e entrega os
+peers ao fluxo normal de conectividade do Luffy.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/domain/MagnetLink.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/PeerConnectivityManager.java`
+- `build.gradle.kts`
+- artefato `bt-core` 1.10 resolvido pelo Gradle
+
+### Arquivos alterados
+
+- `src/test/java/dev/lufi/infrastructure/UdpTrackerCompatibilityIntegrationTest.java`
+- `docs/protocol-compatibility.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- O teste implementa somente um tracker UDP local minimo de BEP 15. Ele nao e
+  parte da aplicacao e nao introduz um cliente tracker proprio no Luffy.
+- A resposta de announce contem um peer IPv4 na forma compacta de seis bytes
+  (quatro do IP e dois da porta), exatamente como em trackers UDP publicos.
+- O teste observa `PeerDiscoveredEvent`, o mesmo evento conectado pelo gateway
+  ao `PeerConnectivityManager`, e confirma a origem `TRACKER` no estado final.
+
+### Testes criados
+
+- magnet com dois parametros `tr` preservados pelo parser e por `toUri()`;
+- handshake/announce UDP com infoHash e porta TCP configurada;
+- resposta compacta de peer IPv4;
+- encaminhamento do peer para o fluxo normal com origem `TRACKER`.
+
+### Testes executados
+
+```text
+gradle --no-daemon test --tests dev.lufi.infrastructure.UdpTrackerCompatibilityIntegrationTest
+gradle --no-daemon test
+```
+
+### Resultado
+
+Teste de interoperabilidade UDP aprovado. O Luffy usa o suporte UDP tracker
+ja existente do bt-core, preserva multiplos `tr` e recebe peers de tracker no
+mesmo fluxo usado por DHT e PEX. A suite completa tambem foi aprovada: **256
+testes**, 256 aprovados, 0 falhando e 0 ignorados.
+
+### Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Etapa 17 - Descoberta paralela
+
+### Objetivo
+
+Unificar DHT, tracker e PEX como fontes complementares de peers de um magnet,
+sem abrir tres downloads nem promover duas vezes o endpoint que o bt-core ja
+recebeu de um tracker.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/PeerConnectivityManager.java`
+- `src/main/java/dev/lufi/infrastructure/BtConnectionLifecycleInstrumentation.java`
+- `src/main/java/dev/lufi/domain/MagnetLink.java`
+- `src/test/java/dev/lufi/infrastructure/PeerConnectivityManagerTest.java`
+- artefato `bt-core` 1.10 resolvido pelo Gradle
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/PeerConnectivityManager.java`
+- `src/test/java/dev/lufi/infrastructure/PeerConnectivityManagerTest.java`
+- `docs/protocol-compatibility.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- O gateway passa a observar `PeerDiscoveredEvent` do bt-core para cada
+  torrent ativo. Um endpoint ainda desconhecido nessa fonte e marcado como
+  `TRACKER` no `PeerConnectivityManager`.
+- DHT e PEX ja eram encaminhados explicitamente ao mesmo gerenciador. O estado
+  e deduplicado por infoHash, familia, transporte, IP e porta, preservando as
+  origens que efetivamente foram observadas.
+- O evento do tracker nao e promovido de novo: o `TrackerPeerSourceFactory` do
+  bt-core ja o inseriu no `IPeerRegistry`. Assim ha uma unica sessao do torrent
+  e uma unica tentativa TCP nativa para esse anuncio de tracker.
+
+### Testes criados
+
+- tracker, DHT e PEX no mesmo endpoint mantem um unico estado com tres
+  origens;
+- uma observacao de tracker isolada nao cria promocao adicional;
+- uma descoberta DHT posterior do mesmo endpoint ainda gera somente uma
+  promocao gerenciada.
+
+### Testes executados
+
+```text
+gradle --no-daemon test --tests dev.lufi.infrastructure.PeerConnectivityManagerTest
+gradle --no-daemon test
+```
+
+### Resultado
+
+Suite focada aprovada e suite completa aprovada: **255 testes**, 255 aprovados,
+0 falhando e 0 ignorados. A descoberta por tracker e agora visivel nos logs como
+`TRACKER PEER DISCOVERED` e chega ao mesmo registro usado por DHT e PEX, sem
+criar uma sessao BitTorrent separada.
+
+### Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Etapa 16 - Auditoria dos trackers do magnet
+
+### Objetivo
+
+Verificar que todos os parametros repetidos `tr=udp://...` sobrevivem ao parse
+e chegam ao suporte de trackers existente no bt-core, sem criar cliente tracker
+proprietario.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/domain/MagnetLink.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/domain/MagnetLinkTest.java`
+- artefato `bt-core` 1.10 resolvido pelo Gradle
+
+### Arquivos alterados
+
+- `docs/protocol-compatibility.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- `MagnetLink.parse(...)` mantem uma lista ordenada de todos os `tr`, enquanto
+  o mapa de parametros continua apenas como compatibilidade retroativa.
+- `MagnetLink.toUri()` reconstrui todos os trackers e o gateway entrega essa
+  string sem transformacao a `Bt.client(...).magnet(...)` em download,
+  diagnostico e Swarm Assist.
+- O bt-core 1.10 ja possui parser de magnet, `TrackerService`, fonte de peers
+  por tracker e UDP tracker. Nenhuma implementacao paralela foi adicionada.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.domain.MagnetLinkTest --rerun-tasks
+```
+
+### Resultado
+
+Etapa aprovada sem alteracao de comportamento: o teste confirma que tres
+trackers UDP repetidos sao preservados integralmente pelo parse e pela
+reconstrucao. A sondagem publica anterior recebeu 19 trackers, concluiu
+handshakes e metadata sem solicitar pieces.
+
+### Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Etapa 15 - Nao rejeitar peer nao-Luffy
+
+### Objetivo
+
+Manter `lf_identity`, `lf_route` e `lf_rendezvous` estritamente opcionais, para
+que torrents publicos possam continuar com handshake BitTorrent, metadata,
+pieces, download, seeding e PEX diante de um cliente que nao conheca o Luffy.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/infrastructure/identity/LuffyIdentityExtension.java`
+- `src/main/java/dev/lufi/infrastructure/Bep55HolePunchAgent.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/identity/LuffyIdentityExtensionTest.java`
+
+### Arquivos alterados
+
+- `src/test/java/dev/lufi/infrastructure/StandardBitTorrentPeerCompatibilityIntegrationTest.java`
+- `docs/protocol-compatibility.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Nenhuma extensao Luffy foi promovida a requisito de BitTorrent.
+- Quando `lf_identity` nao esta no extension handshake remoto,
+  `LuffyIdentityExtension` remove apenas o estado de identidade/overlay da
+  conexao e nao produz mensagem propria para aquele peer.
+- BEP 55 indisponivel tambem nao interrompe TCP: ele fica como capacidade
+  opcional e o protocolo BitTorrent normal segue pelo bt-core.
+
+### Testes criados
+
+- `StandardBitTorrentPeerCompatibilityIntegrationTest` inicia A como Luffy e
+  B como `bt-core` puro, sem `lf_identity`, `lf_route` ou `lf_rendezvous`.
+  A recebe `teste.txt` por TCP, valida o conteudo e confirma que B nao foi
+  registrado como peer Luffy.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.StandardBitTorrentPeerCompatibilityIntegrationTest \
+  --tests dev.lufi.infrastructure.identity.LuffyIdentityExtensionTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 254 |
+| Aprovados | 254 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada. Um peer BitTorrent padrao sem extensoes Luffy transferiu
+`teste.txt` por TCP para o Luffy. O teste publico passivo anterior tambem
+confirmou handshake, PEX e metadata com peers externos que nao anunciaram
+`lf_identity`; arquivos em `SKIP` impediram o recebimento de pieces nessa
+sondagem externa.
+
+### Problemas encontrados
+
+Nenhum. A interoperabilidade por TCP e comprovada; a interoperabilidade uTP e
+BEP 55 com programas externos continua uma validacao separada e nao e exigida
+para download BitTorrent padrao.
+
+### Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Testes de lifecycle e regressao da DHT de lookup
+
+### Objetivo
+
+Comprovar que consultas concorrentes compartilham um unico startup, que nenhuma
+consulta atravessa a barreira antes de READY, que falha e encerramento impedem
+o lookup e que a DHT inicializada nunca chega a `getPeers(...)` sem
+`RPCServerManager`.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycle.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+
+### Arquivos alterados
+
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Os testes exercitam a mesma barreira `DhtLookupRuntimeLifecycle` usada por
+  `BtTorrentGateway.requestDhtLookup(...)`; nao foi introduzida uma segunda
+  implementacao ou um atalho para os testes.
+- O teste de regressao inicia o `MldhtService` real, valida o RPC server em
+  `RUNNING` imediatamente antes de `DHTService.getPeers(...)` e nao depende
+  de encontrar peers externos.
+- A sondagem de bootstrap usou o gateway real, o listener UDP DHT normal e um
+  infoHash sem conteudo, portanto nao criou download nem solicitou pieces.
+
+### Testes criados
+
+- `tenConcurrentLookupRequestsUseOneStartupAndDoNotRunLookupWorkBeforeReady`:
+  dez consultas concorrentes resultam em uma runtime, um startup e dez
+  consultas liberadas somente depois de READY.
+- `failedStartupNeverRunsLookupWorkAndRecoversAfterBackoff`: startup falho
+  bloqueia o lookup, respeita backoff e permite nova runtime READY.
+- `regression_lookupNeverCallsMldhtWithANullServerManager`: prova que a DHT
+  real possui RPC server ativo no momento em que `getPeers(...)` e iniciado.
+- O teste de shutdown passou a afirmar que uma consulta durante `STOPPING` e
+  rejeitada antes de iniciar lookup.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --tests dev.lufi.infrastructure.Bep55HolePunchIntegrationTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 253 |
+| Aprovados | 253 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+A execucao real do gateway registrou, nesta ordem, `LOOKUP RUNTIME STARTING`,
+`RPC SERVER STARTED`, `LOOKUP RUNTIME READY`, `bootstrap started`,
+`nodes known=0` e `LOOKUP START`. O bootstrap elevou a tabela para 21 nos;
+nenhum `SocketTimeoutException`, `nodes known=-1` ou erro de
+`getServerManager() == null` ocorreu. O infoHash de controle retornou zero
+peers, como esperado, e nenhum arquivo foi baixado.
+
+### Problemas encontrados
+
+Na primeira execucao completa, `Bep55HolePunchIntegrationTest` expirou uma vez
+esperando o pareamento local A--C. Ele passou imediatamente quando executado
+isoladamente e a repeticao integral da suite terminou com 253/253. O teste e
+anterior e nao foi alterado nesta etapa; a ocorrencia foi registrada como
+instabilidade de timing da integracao BEP 55, separada do lifecycle DHT.
+
+### Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Logs de lifecycle da runtime DHT de lookup
+
+### Objetivo
+
+Expor o startup e cada consulta DHT com estados verificaveis, sem aceitar
+`nodes known=-1` como indicacao normal de uma runtime pronta.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- A prontidao retorna um estado tipado com quantidade de nos nao negativa e
+  pelo menos um RPC server em execucao.
+- O gateway registra, em ordem, `STARTING`, `RPC SERVER STARTED`, `READY`,
+  bootstrap, contador de nos e o inicio da consulta.
+- Cada peer retornado passa a ser registrado como `PEER DISCOVERED`; o
+  contador final tambem usa o estado real da runtime, nunca um valor sentinela.
+
+### Testes criados
+
+- A prova de inicializacao DHT passou a verificar explicitamente que uma
+  runtime READY possui RPC server ativo e `knownNodes >= 0`.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 252 |
+| Aprovados | 252 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+A sondagem real do infoHash publico `2289f362ea3685afb56f851f8807bfcc465c8066`
+iniciou a runtime, registrou toda a sequencia esperada, retornou 32 peers e
+terminou com `nodes known=20`; nenhum log trouxe `nodes known=-1`.
+
+## Problemas encontrados
+
+Nenhum bloqueio estrutural. Uma tabela DHT recem-inicializada pode iniciar em
+zero nos; isso e valido e distinto de uma runtime sem RPC server.
+
+## Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Separacao entre lookup DHT e announce local
+
+### Objetivo
+
+Preservar a runtime de lookup como descoberta-only mesmo depois do seu startup
+explicito, mantendo announce de torrents locais somente na runtime de
+transferencia.
+
+### Arquivos alterados
+
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Nenhum modulo de announce foi adicionado a runtime de lookup.
+- A garantia usa o `TorrentRegistry` real do bt-core: sem `BtClient` ou torrent
+  ativo, `getPeers(...)` nao possui base para anunciar o infoHash.
+- A runtime de transferencia continua sendo a unica responsavel por seed,
+  download e announce condicionado a conectividade confirmada.
+
+### Testes criados
+
+- A prova de startup DHT agora verifica que o registro de torrents esta vazio
+  antes e depois da consulta `getPeers(...)`.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 252 |
+| Aprovados | 252 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada. A runtime de lookup inicia e executa `getPeers(...)` sem
+registrar torrents, portanto nao anuncia infoHashes locais; announces continuam
+exclusivos da runtime de transferencia.
+
+## Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Compartilhamento da runtime DHT de lookup IPv4
+
+## Registro: Compartilhamento da runtime DHT de lookup IPv4
+
+### Objetivo
+
+Garantir que as finalidades de descoberta IPv4 compartilhem uma unica runtime
+DHT saudavel, sem criar uma runtime por magnet ou infoHash.
+
+### Arquivos alterados
+
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Nenhuma nova runtime foi introduzida: o `BtTorrentGateway` ja possui uma
+  unica lifecycle IPv4 e todos os caminhos chamam `requestDhtLookup(...)`.
+- Cada lookup conserva seu infoHash e sua conclusao assincrona, enquanto a
+  lifecycle compartilha o startup, o listener UDP e a tabela Kademlia.
+- A separacao IPv4/IPv6 foi mantida, pois sao redes DHT distintas.
+
+### Testes criados
+
+- `magnetBootstrapAnnounceAndSwarmAssistShareOneReadyIpv4Runtime` inicia
+  magnet, Ola Luffy, verificacao de announce, Swarm Assist e buscas adicionais
+  em concorrencia, comprovando uma unica criacao e a mesma runtime pronta.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 252 |
+| Aprovados | 252 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada. Magnet, Ola Luffy, verificacao de announce, Swarm Assist e
+outras buscas DHT IPv4 compartilham uma unica runtime em `READY`; nenhuma
+runtime e criada por infoHash.
+
+## Proxima etapa
+
+Aguardar a proxima instrucao explicita do usuario.
+
+---
+
+## Registro: Correcao da descoberta BitTorrent publica
+
+## Registro: Correcao da descoberta BitTorrent publica
+
+### Objetivo
+
+Restaurar a descoberta de peers para magnets publicos sem alterar o motor
+BitTorrent, a DHT, o protocolo de transferencia ou as extensoes do Luffy.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtBootstrapNodes.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/domain/MagnetLink.java`
+- `src/main/java/dev/lufi/infrastructure/SwarmAssistManager.java`
+- `src/test/java/dev/lufi/infrastructure/DhtBootstrapNodesTest.java`
+- `src/test/java/dev/lufi/domain/MagnetLinkTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Os tres bootstrap nodes existentes no `bt-dht` foram preservados e um quarto
+  fallback IPv4 foi adicionado ao `DHTConfig` da mesma runtime.
+- O bootstrap adicional participa apenas da descoberta Kademlia; ele nao
+  recebe video, pieces, metadata nem mensagens do overlay Luffy.
+- `MagnetLink` passou a conservar todos os parametros `tr` repetidos e os
+  repassa ao bt-core quando o magnet e reconstruido.
+- Swarm Assist usa essa mesma reconstrucao e continua com todos os arquivos em
+  `SKIP`, sem solicitar pieces do conteudo.
+
+### Testes criados
+
+- `DhtBootstrapNodesTest` valida o fallback IPv4 e a separacao do caminho IPv6.
+- `MagnetLinkTest.preservesEveryRepeatedTrackerWhenTheMagnetIsRebuilt` valida
+  que todos os trackers repetidos sobrevivem ao parse e a reconstrucao.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.domain.MagnetLinkTest \
+  --tests dev.lufi.infrastructure.DhtBootstrapNodesTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 252 |
+| Aprovados | 252 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Uma sondagem DHT IPv4 do magnet publico retornou 32 peers e preencheu a tabela
+com 115 nos. Em seguida, uma sessao passiva do motor BitTorrent preservou os
+19 trackers recebidos, concluiu handshakes e recebeu metadata, sem verificar
+nem baixar pieces.
+
+## Proxima etapa
+
+Validar a mesma descoberta pela interface do Luffy e, se necessario, registrar
+falhas de tracker separadamente das falhas da DHT.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 7
+
+### Objetivo
+
+Encerrar a runtime DHT em ordem, cancelar consultas pendentes e impedir novos
+lookups assim que o fechamento do Luffy comecar.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycle.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- `close()` marca o gateway como encerrando antes de cancelar consultas e
+  iniciar o shutdown das runtimes DHT.
+- As consultas pendentes recebem cancelamento, suas threads sao interrompidas e
+  o `getPeers(...)` nao e iniciado depois desse marco.
+- `DhtLookupRuntimeLifecycle` muda para `STOPPING`, chama `runtime.shutdown()`
+  e so entao publica `STOPPED`.
+- Se o startup estava pendente, a barreira `dhtReady` e cancelada de imediato,
+  mas o shutdown ainda aguarda a limpeza da runtime criada.
+
+### Testes criados
+
+- `stoppingCancelsTheReadinessBarrierAndWaitsForRuntimeShutdown` prova a ordem
+  de cancelamento, espera pelo shutdown e bloqueio de novo startup.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 249 |
+| Aprovados | 249 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. O fechamento cancela consultas DHT pendentes, nao
+aceita novos lookups e publica `STOPPED` somente depois de `runtime.shutdown()`.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 6
+
+### Objetivo
+
+Encerrar runtimes DHT parcialmente iniciadas, descartar referencias corrompidas
+e permitir nova tentativa somente apos um backoff configuravel.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeSettings.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycle.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeSettingsTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- A transicao para `FAILED` encerra a runtime criada, limpa a referencia e
+  conclui a barreira com erro.
+- `dhtRetryBackoff` e configuravel; o padrao e 5 segundos.
+- Durante backoff, novas consultas recebem erro claro e nao criam sockets,
+  runtimes ou startups adicionais.
+- Depois do prazo, uma unica consulta pode criar uma nova runtime; ela nunca
+  reutiliza a instancia que falhou.
+
+### Testes criados
+
+- A prova `failedStartupClosesTheRuntimeAndAppliesBackoffBeforeRecreatingIt`
+  verifica fechamento, limpeza, bloqueio durante o prazo e nova criacao depois
+  do backoff.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeSettingsTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 248 |
+| Aprovados | 248 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. Falhas encerram e descartam a runtime DHT; novas
+tentativas respeitam o backoff configuravel antes de criar uma instancia nova.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 5
+
+### Objetivo
+
+Limitar a espera de startup da runtime DHT de lookup e registrar uma falha
+clara quando o servidor RPC nao ficar pronto.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeSettings.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeSettingsTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- `dhtStartupTimeout` e configuravel, com valor padrao de 15 segundos.
+- O timeout e aplicado apenas ao `Config` da runtime de lookup. O lifecycle do
+  bt-core usa esse limite para aguardar o binding assincrono do `MldhtService`.
+- Sem `RPCServerManager` e `RPCServer` utilizavel ao fim do startup, o
+  lifecycle falha e a barreira de prontidao e completada excepcionalmente.
+- O log usa a causa clara `RPC server did not become ready`; nenhum `getPeers`
+  recebe a runtime que falhou.
+
+### Testes criados
+
+- `DhtLookupRuntimeSettingsTest`: valor padrao de 15 segundos e rejeicao de
+  valores zero ou negativos.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeSettingsTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 247 |
+| Aprovados | 247 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. A runtime DHT de lookup possui timeout configuravel
+de 15 segundos e nao libera `getPeers(...)` caso o servidor RPC nao fique
+pronto.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 4
+
+### Objetivo
+
+Exigir evidencia concreta de que o mldht iniciou antes de marcar a runtime DHT
+de lookup como pronta, sem usar espera por tempo ou polling.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- `BtRuntime.startup()` e a barreira do lifecycle do bt-core: ele aguarda o
+  binding assincrono do `MldhtService` terminar.
+- Depois disso, o inicializador exige `DHT.getServerManager() != null` e um
+  `RPCServer` no estado `RUNNING` retornado pelo `RPCServerManager`.
+- Ausencia do manager ou de um servidor utilizavel e falha de inicializacao;
+  a runtime nao chega a `READY`.
+- Nenhum `Thread.sleep(...)`, polling ou palpite temporal participa do criterio.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 245 |
+| Aprovados | 245 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. A prontidao depende exclusivamente do lifecycle
+concluido do bt-core e de estado verificavel do `RPCServerManager`/`RPCServer`.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 3
+
+### Objetivo
+
+Criar uma barreira de prontidao real para impedir qualquer `getPeers(...)`
+antes de a inicializacao assincrona do `MldhtService` concluir.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycle.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- O lifecycle possui uma barreira `CompletableFuture<Void>` por familia DHT.
+- A thread de startup e a unica que conclui a barreira, somente depois de
+  `DhtLookupRuntimeInitializer` observar o `RPCServerManager` e listener UDP
+  em execucao.
+- Todas as consultas chamam `awaitDhtReady(...)` antes de obter a runtime e
+  executar `DHTService.getPeers(...)`.
+- Falha e encerramento completam a barreira excepcionalmente; nenhuma consulta
+  recebe uma runtime parcialmente inicializada.
+
+### Testes criados
+
+- A prova `readinessBarrierCompletesOnlyAfterTheDhtStartupFinishes` confirma
+  que a barreira fica pendente em `STARTING` e so completa em `READY`.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 245 |
+| Aprovados | 245 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. Nenhuma consulta DHT atinge `getPeers(...)` antes
+de a barreira compartilhada `dhtReady` ser concluida com a runtime em `READY`.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 2
+
+### Objetivo
+
+Evitar startups concorrentes na runtime DHT exclusiva de lookup e tornar seu
+ciclo de vida observavel e seguro para consultas simultaneas.
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/DhtLookupState.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycle.java`
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeLifecycleTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- Cada familia IP possui uma maquina de estados independente: `NEW`,
+  `STARTING`, `READY`, `FAILED`, `STOPPING` e `STOPPED`.
+- O primeiro chamador cria, guarda e inicializa a runtime. Chamadores que
+  chegam em `STARTING` aguardam a mesma inicializacao, sem executar outro
+  `startup()`.
+- Uma falha deixa o estado `FAILED` visivel aos chamadores que aguardavam a
+  tentativa; uma consulta posterior pode criar uma runtime nova.
+- O encerramento muda para `STOPPING`, aguarda startup pendente se necessario
+  e termina em `STOPPED`, sem permitir reinicio posterior.
+
+### Testes criados
+
+- `DhtLookupRuntimeLifecycleTest`: concorrencia, compartilhamento de instancia,
+  transicao para falha com nova tentativa e bloqueio de restart apos stop.
+
+### Testes executados
+
+```text
+gradle test --tests dev.lufi.infrastructure.DhtLookupRuntimeLifecycleTest \
+  --tests dev.lufi.infrastructure.DhtLookupRuntimeInitializerTest --rerun-tasks
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 244 |
+| Aprovados | 244 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Etapa aprovada localmente. Consultas DHT simultaneas compartilham uma unica
+inicializacao e so recebem a runtime depois de ela alcancar `READY`.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
+
+## Registro: Correcao da runtime DHT de lookup - Etapa 1
+
+### Objetivo
+
+Garantir que a runtime exclusiva usada para descoberta DHT IPv4 seja iniciada
+antes da primeira chamada a `DHTService.getPeers(...)`, sem criar uma runtime
+por consulta e sem alterar o protocolo BitTorrent normal.
+
+### Arquivos analisados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/LuffyDhtDiscoveryModule.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `bt-dht` 1.10 (`MldhtService`, `DHT` e `RPCServerManager`)
+
+### Arquivos alterados
+
+- `src/main/java/dev/lufi/infrastructure/BtTorrentGateway.java`
+- `src/main/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializer.java`
+- `src/test/java/dev/lufi/infrastructure/DhtLookupRuntimeInitializerTest.java`
+- `docs/dht-lookup-runtime.md`
+- `docs/overlay-implementation-progress.md`
+
+### Decisoes tecnicas
+
+- A runtime e guardada antes do startup e permanece compartilhada por todas as
+  consultas IPv4 enquanto saudavel.
+- `DhtLookupRuntimeInitializer` chama `runtime.startup()` e espera a criacao
+  do `RPCServerManager` e um servidor UDP em estado `RUNNING`.
+- Em falha de inicializacao a referencia compartilhada e removida e a runtime
+  e encerrada; uma consulta posterior pode criar uma nova runtime saudavel.
+- Nao foi usado um `catch` para esconder a excecao do `getPeers`. A origem da
+  excecao foi removida inicializando de fato o `MldhtService`.
+- A disponibilidade externa continua separada: listener local ativo nao prova
+  que bootstrap UDP, roteador ou firewall permitam trafego pela Internet.
+
+### Testes criados
+
+- `DhtLookupRuntimeInitializerTest` inicia uma runtime DHT IPv4 real em porta
+  UDP temporaria, verifica o startup e confirma que o primeiro lookup nao
+  falha por `DHT.getServerManager()` nulo.
+
+### Testes executados
+
+```text
+gradle test --rerun-tasks
+```
+
+| Metrica | Resultado |
+| --- | ---: |
+| Testes totais | 241 |
+| Aprovados | 241 |
+| Falhando | 0 |
+| Ignorados | 0 |
+
+### Resultado
+
+Correcao aprovada localmente. A runtime de lookup DHT e iniciada antes de
+`getPeers(...)`, e a suite completa nao encontrou regressao no motor
+BitTorrent, PEX, uTP, BEP 55 ou overlay existente.
+
+### Problemas encontrados
+
+- `DHTService` nao oferece uma API publica de prontidao. O acesso ao `DHT`
+  interno ficou concentrado em uma unica classe adaptadora, com validacao de
+  compatibilidade para `bt-dht` 1.10.
+
+## Proxima etapa
+
+Aguardar a instrucao explicita do usuario depois da validacao desta correcao.
+
+---
 
 ## Registro da Etapa 1
 
