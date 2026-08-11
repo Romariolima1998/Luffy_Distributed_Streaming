@@ -74,6 +74,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     private static final Duration SWARM_ASSIST_MAINTENANCE_INTERVAL = Duration.ofMinutes(5);
     private static final Duration SWARM_ASSIST_REPLENISH_DELAY = Duration.ofSeconds(5);
     private static final Duration SWARM_ASSIST_PEX_FRESHNESS = Duration.ofMinutes(2);
+    /** Margem inicial contínua antes de abrir um arquivo temporário no player. */
+    private static final int STREAM_STARTUP_PIECES = 24;
     private final Path cacheDirectory;
     private final P2pDiagnostics diagnostics;
     private final Map<String, BtClient> sessions = new ConcurrentHashMap<>();
@@ -279,8 +281,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         if (infoHash == null || infoHash.isBlank()) return StreamingBufferStatus.unavailable();
         TransferSnapshot snapshot = transferSnapshots.get(infoHash.toLowerCase());
         boolean active = isTorrentSessionActive(infoHash);
-        if (snapshot == null) return new StreamingBufferStatus(0, 0, 0, 0, 12, active);
-        int required = snapshot.piecesTotal() > 0 ? Math.min(12, snapshot.piecesTotal()) : 12;
+        if (snapshot == null) return new StreamingBufferStatus(0, 0, 0, 0, STREAM_STARTUP_PIECES, active);
+        int required = snapshot.piecesTotal() > 0 ? Math.min(STREAM_STARTUP_PIECES, snapshot.piecesTotal()) : STREAM_STARTUP_PIECES;
         int contiguousPrefix = streamingPiecePrefixes.contiguousPrefix(infoHash, snapshot.piecesTotal());
         return new StreamingBufferStatus(snapshot.downloaded(), snapshot.piecesComplete(), contiguousPrefix,
                 snapshot.piecesTotal(), required, active);
@@ -1949,12 +1951,15 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     public record DiagnosticTestResult(Path receivedFile, boolean contentVerified, String content, String outcome, String detail) { }
     public record StreamingBufferStatus(long downloadedBytes, int verifiedPieces, int contiguousPrefixPieces,
                                         int totalPieces, int requiredPieces, boolean sessionActive) {
-        private static final int INITIAL_CONTIGUOUS_PIECES = 4;
         public boolean playable() {
-            return totalPieces > 0 && verifiedPieces >= requiredPieces && contiguousPrefixPieces >= requiredPrefixPieces();
+            return totalPieces > 0 && contiguousPrefixPieces >= requiredPrefixPieces();
         }
-        public int requiredPrefixPieces() { return Math.min(INITIAL_CONTIGUOUS_PIECES, Math.max(1, totalPieces)); }
-        static StreamingBufferStatus unavailable() { return new StreamingBufferStatus(0, 0, 0, 0, 12, false); }
+        public int requiredPrefixPieces() {
+            return Math.min(Math.max(1, requiredPieces), Math.max(1, totalPieces));
+        }
+        static StreamingBufferStatus unavailable() {
+            return new StreamingBufferStatus(0, 0, 0, 0, STREAM_STARTUP_PIECES, false);
+        }
     }
     private record TransferSnapshot(long downloaded, int piecesRemaining, int piecesComplete, int piecesTotal) { }
 }

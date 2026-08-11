@@ -88,6 +88,8 @@ public final class LufiApplication extends Application {
             }, diagnostics);
     private final ConnectivityService connectivity = new ConnectivityService(diagnostics);
     private final AtomicBoolean savedLibrariesLoaded = new AtomicBoolean();
+    /** Garante que fechar a janela e Application.stop não deixem áudio ou rede rodando em segundo plano. */
+    private final AtomicBoolean applicationShutdown = new AtomicBoolean();
     private final WatchVideo watchVideo = new WatchVideo(torrents);
     private final Label status = new Label("Pronto para receber um magnet link.");
     private TextArea connectivityPanelOutput;
@@ -124,6 +126,7 @@ public final class LufiApplication extends Application {
 
     @Override public void start(Stage stage) {
         primaryStage = stage;
+        stage.setOnCloseRequest(event -> shutdownApplication());
         if (settings.get("cache.max.gb").isEmpty()) showOnboarding(stage); else showMain(stage);
     }
     private void showOnboarding(Stage stage) {
@@ -345,7 +348,7 @@ public final class LufiApplication extends Application {
             } catch (IllegalArgumentException error) { status.setText(error.getMessage()); }
         });
         TextArea output = new TextArea(diagnostics.snapshot()); output.setEditable(false); output.setWrapText(false); output.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 11px;");
-        diagnostics.subscribe(line -> Platform.runLater(() -> { output.appendText((output.getText().isEmpty() ? "" : System.lineSeparator()) + line); output.positionCaret(output.getLength()); }));
+        bindDiagnosticOutput(output);
         Button copy = new Button("Copiar log"); copy.setOnAction(e -> { ClipboardContent content = new ClipboardContent(); content.putString(output.getText()); Clipboard.getSystemClipboard().setContent(content); });
         Button clear = new Button("Limpar"); clear.setOnAction(e -> { diagnostics.clear(); output.clear(); });
         HBox actions = new HBox(10, createSeed, copyTestMagnet, downloadTest, copy, clear); actions.setAlignment(Pos.CENTER_LEFT);
@@ -392,10 +395,7 @@ public final class LufiApplication extends Application {
         TextArea terminal = new TextArea(diagnostics.snapshot());
         terminal.setEditable(false); terminal.setWrapText(false);
         terminal.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 11px;");
-        diagnostics.subscribe(line -> Platform.runLater(() -> {
-            terminal.appendText((terminal.getText().isEmpty() ? "" : System.lineSeparator()) + line);
-            terminal.positionCaret(terminal.getLength());
-        }));
+        bindDiagnosticOutput(terminal);
         Button copyLog = new Button("Copiar todos os logs");
         copyLog.setOnAction(e -> { ClipboardContent content = new ClipboardContent(); content.putString(terminal.getText()); Clipboard.getSystemClipboard().setContent(content); });
         Button clearLog = new Button("Limpar terminal");
@@ -427,7 +427,7 @@ public final class LufiApplication extends Application {
         Button activateHello = new Button("Ativar teste de olá"); activateHello.setOnAction(e -> activateHelloTest());
         Button sendHello = new Button("Enviar olá"); sendHello.setOnAction(e -> hello.send(destination.getText()));
         TextArea output = new TextArea(diagnostics.snapshot()); output.setEditable(false); output.setWrapText(false); output.setStyle("-fx-font-family: 'Consolas'; -fx-font-size: 11px;");
-        diagnostics.subscribe(line -> Platform.runLater(() -> { output.appendText((output.getText().isEmpty() ? "" : System.lineSeparator()) + line); output.positionCaret(output.getLength()); }));
+        bindDiagnosticOutput(output);
         Button copy = new Button("Copiar log"); copy.setOnAction(e -> { ClipboardContent content = new ClipboardContent(); content.putString(output.getText()); Clipboard.getSystemClipboard().setContent(content); });
         Button clear = new Button("Limpar"); clear.setOnAction(e -> { diagnostics.clear(); output.clear(); });
         HBox actions = new HBox(10, activateHello, destination, sendHello, copy, clear); actions.setAlignment(Pos.CENTER_LEFT);
@@ -667,6 +667,9 @@ public final class LufiApplication extends Application {
         if (selected == null || !selected.getValue().video()) { status.setText("Selecione um vídeo da árvore da biblioteca primeiro."); return; }
         playLocal(new FoundVideo(selected.getValue().name(), selected.getValue().path()));
     }
+    private void bindDiagnosticOutput(TextArea output) {
+        diagnostics.subscribe(new DiagnosticTextAreaAppender(output));
+    }
     private Scene scene(javafx.scene.Parent root) { Scene scene = new Scene(root); scene.getStylesheets().add(getClass().getResource("/lufi.css").toExternalForm()); return scene; }
     private void playLocal(FoundVideo video) {
         long generation = resetPlayback();
@@ -695,7 +698,7 @@ public final class LufiApplication extends Application {
             @Override public void onReady() {
                 if (!isCurrentFfmpegPlayback(generation)) return;
                 playerPlaceholder.setVisible(false);
-                nowPlaying.setText("Reproduzindo: " + video.name() + " (MKV/FFmpeg)");
+                nowPlaying.setText("Reproduzindo: " + video.name() + " (FFmpeg)");
                 torrents.setForegroundPlaybackActive(true);
             }
 
@@ -712,13 +715,17 @@ public final class LufiApplication extends Application {
             @Override public void onFailure(Throwable error) {
                 if (!isCurrentFfmpegPlayback(generation)) return;
                 torrents.setForegroundPlaybackActive(false); playerPlaceholder.setVisible(true);
-                status.setText("Não foi possível decodificar o MKV: " + conciseMediaError(error));
+                status.setText("Não foi possível decodificar o vídeo: " + conciseMediaError(error));
+            }
+
+            @Override public void onDiagnostic(String message) {
+                diagnostics.log(P2pDiagnostics.Layer.RESULT, message);
             }
         });
         ffmpegPlayer = created;
         created.setVolume(playbackVolume);
         tabs.getSelectionModel().select(0);
-        status.setText("Carregando MKV com o decodificador integrado…");
+        status.setText("Carregando vídeo com o decodificador integrado…");
         created.start();
     }
 
@@ -791,7 +798,8 @@ public final class LufiApplication extends Application {
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER READY: requestId=" + requestId + "; infoHash="
                                 + infoHash + "; downloadedBytes=" + buffer.downloadedBytes() + "; pieces="
                                 + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
-                                + buffer.contiguousPrefixPieces() + "; fileBytes=" + Files.size(video.path()) + ".");
+                                + buffer.contiguousPrefixPieces() + "; required=" + buffer.requiredPrefixPieces()
+                                + "; fileBytes=" + Files.size(video.path()) + ".");
                         Platform.runLater(() -> {
                             if (streamingRequest.get() == requestId) playLocal(video);
                         });
@@ -830,7 +838,21 @@ public final class LufiApplication extends Application {
             } catch (Exception error) { Platform.runLater(() -> status.setText("Não foi possível preparar o streaming deste vídeo.")); }
         });
     }
-    @Override public void stop() { swarmAssistManager.close(); resetPlayback(); connectivity.close(); torrents.close(); Platform.exit(); }
+    @Override public void stop() {
+        shutdownApplication();
+        Platform.exit();
+    }
+
+    /** Fecha os recursos em ordem, de modo idempotente, inclusive quando a janela é fechada pelo sistema. */
+    private void shutdownApplication() {
+        if (!applicationShutdown.compareAndSet(false, true)) return;
+        streamingRequest.incrementAndGet();
+        hideControls.stop();
+        resetPlayback();
+        swarmAssistManager.close();
+        connectivity.close();
+        torrents.close();
+    }
     private record FoundVideo(String name, Path path) { @Override public String toString() { return name; } }
     private record WatchEntry(String name, String relativePath, Path path) { @Override public String toString() { return name; } }
     private record WatchContext(String magnet, WatchMode mode) { }

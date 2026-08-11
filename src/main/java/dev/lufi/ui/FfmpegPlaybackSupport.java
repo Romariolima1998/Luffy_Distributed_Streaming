@@ -4,10 +4,11 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.Set;
 
-/** Decide quando o player integrado deve usar os codecs FFmpeg em vez do JavaFX Media. */
+/** Seleciona o decodificador integrado para todos os formatos de vídeo aceitos pelo Luffy. */
 final class FfmpegPlaybackSupport {
     private static final Set<String> FFMPEG_CONTAINERS = Set.of(
-            "mkv", "webm", "avi", "flv", "vob", "asf", "wmv", "ts", "m2ts", "mts", "ogv"
+            "mp4", "m4v", "mov", "mkv", "webm", "avi", "flv", "vob", "asf", "wmv", "ts", "m2ts", "mts",
+            "ogv", "mpeg", "mpg", "3gp"
     );
 
     private FfmpegPlaybackSupport() {

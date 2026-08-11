@@ -1,18 +1,18 @@
 package dev.lufi.ui;
 
-import org.junit.jupiter.api.Test;
-
-import java.nio.file.Path;
-
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Path;
+import org.junit.jupiter.api.Test;
+
 class FfmpegPlaybackSupportTest {
-    @Test void directsMkvToTheIntegratedFfmpegDecoderRegardlessOfFilenameCase() {
-        assertTrue(FfmpegPlaybackSupport.isRequiredFor(Path.of("serie", "episodio.MKV")));
+    @Test void usesTheIntegratedDecoderForMp4AndMkv() {
+        assertTrue(FfmpegPlaybackSupport.isRequiredFor(Path.of("sample.mp4")));
+        assertTrue(FfmpegPlaybackSupport.isRequiredFor(Path.of("sample.mkv")));
     }
 
-    @Test void keepsNativeJavaFxPathForMp4() {
-        assertFalse(FfmpegPlaybackSupport.isRequiredFor(Path.of("episodio.mp4")));
+    @Test void leavesUnknownFilesOutsideTheVideoDecoder() {
+        assertFalse(FfmpegPlaybackSupport.isRequiredFor(Path.of("notes.txt")));
     }
 }

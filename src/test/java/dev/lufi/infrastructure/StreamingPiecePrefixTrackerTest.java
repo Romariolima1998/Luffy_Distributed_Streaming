@@ -37,9 +37,9 @@ class StreamingPiecePrefixTrackerTest {
         assertEquals(0, tracker.contiguousPrefix("abc", 100));
     }
 
-    @Test void refusesToOpenPreallocatedFilesWithoutTheBeginningOfTheStream() {
-        var scattered = new BtTorrentGateway.StreamingBufferStatus(15_000_000, 12, 0, 1_385, 12, true);
-        var contiguous = new BtTorrentGateway.StreamingBufferStatus(15_000_000, 12, 4, 1_385, 12, true);
+    @Test void waitsForTheEntireConfiguredContinuousStartupBuffer() {
+        var scattered = new BtTorrentGateway.StreamingBufferStatus(30_000_000, 24, 4, 1_385, 24, true);
+        var contiguous = new BtTorrentGateway.StreamingBufferStatus(30_000_000, 24, 24, 1_385, 24, true);
 
         assertFalse(scattered.playable());
         assertTrue(contiguous.playable());
