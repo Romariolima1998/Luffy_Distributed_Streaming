@@ -5,11 +5,13 @@ import javafx.scene.image.ImageView;
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory;
 import uk.co.caprica.vlcj.player.base.MediaPlayer;
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter;
+import uk.co.caprica.vlcj.player.base.TrackDescription;
 import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer;
 import uk.co.caprica.vlcj.support.version.Version;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -203,6 +205,39 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
     }
 
     @Override
+    public List<MediaTrack> audioTracks() {
+        EmbeddedMediaPlayer current = mediaPlayer;
+        if (current == null) return List.of();
+        return describeTracks(current.audio().trackDescriptions(), current.audio().track());
+    }
+
+    @Override
+    public List<MediaTrack> subtitleTracks() {
+        EmbeddedMediaPlayer current = mediaPlayer;
+        if (current == null) return List.of();
+        return describeTracks(current.subpictures().trackDescriptions(), current.subpictures().track());
+    }
+
+    @Override
+    public boolean selectAudioTrack(int trackId) {
+        EmbeddedMediaPlayer current = mediaPlayer;
+        return current != null && current.audio().setTrack(trackId) == 0;
+    }
+
+    @Override
+    public boolean selectSubtitleTrack(int trackId) {
+        EmbeddedMediaPlayer current = mediaPlayer;
+        return current != null && current.subpictures().setTrack(trackId) == 0;
+    }
+
+    @Override
+    public boolean setExternalSubtitle(URI subtitleUri) {
+        EmbeddedMediaPlayer current = mediaPlayer;
+        return current != null && current.subpictures().setSubTitleUri(
+                Objects.requireNonNull(subtitleUri, "subtitleUri").toASCIIString());
+    }
+
+    @Override
     public LuffyVideoView createVideoView() {
         LuffyVideoView videoView = new LuffyVideoView();
         videoView.bindImage(pixelBufferImageView.imageProperty());
@@ -242,10 +277,20 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             }
             mediaPlayerFactory = factory;
             listener.onDiagnostic("[PLAYER] backend=LIBVLC; event=RUNTIME_READY; vlcj=4.12.1; libvlc=" + nativeVersion
-                    + "; directRendering=true; discoveryPath=" + discovery.path()
+                    + "; directRendering=true; hardwareAcceleration=software-direct-rendering"
+                    + "; discoveryPath=" + discovery.path()
                     + "; discoveryStrategy=" + discovery.strategy() + ".");
             return factory.mediaPlayers().newEmbeddedMediaPlayer();
         }
+    }
+
+    private static List<MediaTrack> describeTracks(List<TrackDescription> descriptions, int selectedTrackId) {
+        if (descriptions == null || descriptions.isEmpty()) return List.of();
+        return descriptions.stream()
+                .filter(Objects::nonNull)
+                .map(description -> new MediaTrack(description.id(), description.description(),
+                        description.id() == selectedTrackId))
+                .toList();
     }
 
     private void configureEvents(EmbeddedMediaPlayer configuredPlayer) {

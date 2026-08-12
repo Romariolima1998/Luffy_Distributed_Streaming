@@ -4,6 +4,7 @@ import javafx.scene.Node;
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -68,6 +69,31 @@ interface MediaPlayerBackend extends AutoCloseable {
     boolean isPaused();
 
     boolean isSeekable();
+
+    /** Faixas de audio conhecidas, sem expor tipos internos do backend. */
+    default List<MediaTrack> audioTracks() {
+        return List.of();
+    }
+
+    /** Faixas de legenda embutidas, sem alterar a selecao atual. */
+    default List<MediaTrack> subtitleTracks() {
+        return List.of();
+    }
+
+    /** Seleciona uma faixa de audio quando o backend oferecer esse recurso. */
+    default boolean selectAudioTrack(int trackId) {
+        return false;
+    }
+
+    /** Seleciona uma faixa de legenda embutida quando o backend oferecer esse recurso. */
+    default boolean selectSubtitleTrack(int trackId) {
+        return false;
+    }
+
+    /** Associa uma legenda externa quando o backend oferecer esse recurso. */
+    default boolean setExternalSubtitle(URI subtitleUri) {
+        return false;
+    }
 
     /** Cria uma superfície JavaFX ligada à mesma reprodução. Também é usada na tela cheia. */
     Node createVideoView();

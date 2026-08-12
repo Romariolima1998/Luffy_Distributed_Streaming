@@ -42,6 +42,7 @@ import javafx.scene.media.Media;
 import javafx.scene.media.MediaPlayer;
 import javafx.scene.media.MediaView;
 import javafx.stage.DirectoryChooser;
+import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import javafx.stage.Screen;
 import javafx.stage.StageStyle;
@@ -120,6 +121,8 @@ public final class LufiApplication extends Application {
     private final List<Label> playbackTimeLabels = new ArrayList<>();
     private final List<Slider> volumeControls = new ArrayList<>();
     private final List<Button> muteControls = new ArrayList<>();
+    private final List<MenuButton> audioTrackControls = new ArrayList<>();
+    private final List<MenuButton> subtitleTrackControls = new ArrayList<>();
     private Duration currentPlaybackPosition = Duration.ZERO;
     private Duration currentPlaybackDuration = Duration.UNKNOWN;
     private boolean synchronizingSeekControls;
@@ -131,12 +134,12 @@ public final class LufiApplication extends Application {
     /** Cancela a espera de buffer anterior quando o usuário escolhe outro vídeo. */
     private final AtomicLong streamingRequest = new AtomicLong();
     private final PauseTransition hideControls = new PauseTransition(Duration.seconds(4));
-    private HBox playerControls;
+    private VBox playerControls;
     private Stage primaryStage;
     private Stage fullscreenPlayerStage;
     private MediaView fullscreenMediaView;
     private javafx.scene.Node fullscreenBackendView;
-    private HBox fullscreenControls;
+    private VBox fullscreenControls;
 
     @Override public void start(Stage stage) {
         primaryStage = stage;
@@ -202,8 +205,8 @@ public final class LufiApplication extends Application {
         Label playlistTitle = new Label("Vídeos da pasta compartilhada"); playlistTitle.getStyleClass().add("panel-title");
         watchPlaylist.setPlaceholder(new Label("Abra um magnet para carregar a pasta."));
         watchPlaylist.setOnMouseClicked(event -> { if (event.getClickCount() == 2 && watchPlaylist.getSelectionModel().getSelectedItem() != null) openWatchEntry(watchPlaylist.getSelectionModel().getSelectedItem()); });
-        VBox playlist = new VBox(10, playlistTitle, watchPlaylist); playlist.getStyleClass().add("library-panel"); playlist.setMinWidth(220); VBox.setVgrow(watchPlaylist, Priority.ALWAYS);
-        SplitPane playback = new SplitPane(playerSurface(), playlist); playback.setDividerPositions(.72);
+        VBox playlist = new VBox(10, playlistTitle, watchPlaylist); playlist.getStyleClass().add("library-panel"); playlist.setMinWidth(300); VBox.setVgrow(watchPlaylist, Priority.ALWAYS);
+        SplitPane playback = new SplitPane(playerSurface(), playlist); playback.setDividerPositions(.60);
         VBox box = new VBox(16, heading, hint, new HBox(10, magnet, open), status, playback); box.setPadding(new Insets(24));
         VBox.setVgrow(playback, Priority.ALWAYS);
         return new Tab("Assistir", box);
@@ -215,46 +218,66 @@ public final class LufiApplication extends Application {
         playerPlaceholder.getChildren().setAll(nowPlaying); playerPlaceholder.setAlignment(Pos.CENTER);
         mediaView.setPreserveRatio(true); mediaView.fitWidthProperty().bind(playerSurface.widthProperty()); mediaView.fitHeightProperty().bind(playerSurface.heightProperty());
         backendVideoSurface.setVisible(false);
-        StackPane.setAlignment(playerControls, Pos.BOTTOM_CENTER); StackPane.setMargin(playerControls, new Insets(16));
+        StackPane.setAlignment(playerControls, Pos.BOTTOM_CENTER); StackPane.setMargin(playerControls, new Insets(12));
         hideControls.setOnFinished(e -> {
-            HBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
+            VBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
             if (active != null) active.setVisible(false);
         });
         playerSurface.setOnMouseMoved(e -> revealControls());
         playerSurface.setOnMouseEntered(e -> revealControls());
-        playerSurface.getChildren().setAll(mediaView, backendVideoSurface, playerPlaceholder, playerControls); playerSurface.getStyleClass().add("player"); playerSurface.setMinHeight(260); return playerSurface;
+        playerSurface.getChildren().setAll(mediaView, backendVideoSurface, playerPlaceholder, playerControls); playerSurface.getStyleClass().add("player"); playerSurface.setMinHeight(220); return playerSurface;
     }
     private void revealControls() {
-        HBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
+        VBox active = fullscreenPlayerStage == null ? playerControls : fullscreenControls;
         if (active == null) return;
         active.setVisible(true); hideControls.playFromStart();
     }
-    private HBox createPlayerControls(boolean fullscreen) {
-        Button play = new Button("Play"); play.setOnAction(e -> resumePlayback());
-        Button pause = new Button("Pausar"); pause.setOnAction(e -> pausePlayback());
-        Button stop = new Button("Parar"); stop.setOnAction(e -> stopPlayback());
-        Slider seek = new Slider(0, 1, 0); seek.setPrefWidth(190); seek.setDisable(true);
+    private VBox createPlayerControls(boolean fullscreen) {
+        Button play = commandButton("▶", "Reproduzir"); play.setOnAction(e -> resumePlayback());
+        Button pause = commandButton("⏸", "Pausar"); pause.setOnAction(e -> pausePlayback());
+        Button stop = commandButton("⏹", "Parar"); stop.setOnAction(e -> stopPlayback());
+        Slider seek = new Slider(0, 1, 0); seek.setMinWidth(120); seek.setDisable(true); HBox.setHgrow(seek, Priority.ALWAYS);
         Label time = new Label("00:00 / --:--"); time.getStyleClass().add("muted");
         seek.setOnMouseReleased(e -> seekToFraction(seek.getValue()));
         seek.valueChangingProperty().addListener((observable, wasChanging, isChanging) -> {
             if (wasChanging && !isChanging) seekToFraction(seek.getValue());
         });
         seekControls.add(seek); playbackTimeLabels.add(time); refreshSeekControls();
-        Slider volume = new Slider(0, 1, playbackVolume); volume.setPrefWidth(130);
+        Slider volume = new Slider(0, 1, playbackVolume); volume.setPrefWidth(96);
         volume.valueProperty().addListener((observable, oldValue, value) -> {
             if (!synchronizingAudioControls) setPlaybackVolume(value.doubleValue());
         });
-        Button mute = new Button();
+        Button mute = commandButton("", "Ativar ou silenciar som");
         mute.setOnAction(e -> setPlaybackMuted(!playbackMuted));
         volumeControls.add(volume); muteControls.add(mute); refreshAudioControls();
-        HBox controls = new HBox(10, play, pause, stop, time, seek, new Label("Volume"), volume, mute);
-        Button display = new Button(fullscreen ? "Minimizar" : "Tela cheia");
+        MenuButton audioTracks = trackButton("🔊", "Faixa de áudio");
+        MenuButton subtitles = trackButton("💬", "Legendas");
+        audioTrackControls.add(audioTracks); subtitleTrackControls.add(subtitles); refreshTrackControls();
+        Button display = commandButton(fullscreen ? "↙" : "⛶", fullscreen ? "Sair da tela cheia" : "Tela cheia");
         display.setOnAction(e -> {
             if (fullscreen) minimizePlayer(); else togglePlayerFullscreen();
         });
-        controls.getChildren().add(display);
-        controls.setAlignment(Pos.CENTER); controls.getStyleClass().add("player-controls");
+        HBox timeline = new HBox(8, time, seek, mute, volume); timeline.setAlignment(Pos.CENTER_LEFT);
+        timeline.getStyleClass().add("player-controls-top");
+        HBox commands = new HBox(8, play, pause, stop, audioTracks, subtitles, display); commands.setAlignment(Pos.CENTER);
+        commands.getStyleClass().add("player-controls-bottom");
+        VBox controls = new VBox(8, timeline, commands); controls.setAlignment(Pos.CENTER); controls.getStyleClass().add("player-controls");
         return controls;
+    }
+
+    private Button commandButton(String icon, String tooltip) {
+        Button button = new Button(icon);
+        button.getStyleClass().add("player-command");
+        button.setTooltip(new Tooltip(tooltip));
+        return button;
+    }
+
+    private MenuButton trackButton(String icon, String tooltip) {
+        MenuButton button = new MenuButton(icon);
+        button.getStyleClass().addAll("player-command", "player-track");
+        button.setTooltip(new Tooltip(tooltip));
+        button.setDisable(true);
+        return button;
     }
 
     /** Busca local sem depender do transporte que estiver ativo no aplicativo. */
@@ -323,10 +346,82 @@ public final class LufiApplication extends Application {
             for (Slider volume : volumeControls) {
                 volume.setValue(playbackVolume);
             }
-            String label = playbackMuted ? "Ativar som" : "Silenciar";
-            muteControls.forEach(button -> button.setText(label));
+            String icon = playbackMuted ? "🔇" : "🔊";
+            String tooltip = playbackMuted ? "Ativar som" : "Silenciar";
+            muteControls.forEach(button -> {
+                button.setText(icon);
+                button.setTooltip(new Tooltip(tooltip));
+            });
         } finally {
             synchronizingAudioControls = false;
+        }
+    }
+
+    private void refreshTrackControls() {
+        if (!Platform.isFxApplicationThread()) {
+            Platform.runLater(this::refreshTrackControls);
+            return;
+        }
+        List<MediaTrack> audioTracks = backendPlayer == null ? List.of() : backendPlayer.audioTracks();
+        List<MediaTrack> subtitleTracks = backendPlayer == null ? List.of() : backendPlayer.subtitleTracks();
+        for (MenuButton menu : audioTrackControls) {
+            populateTrackMenu(menu, audioTracks, true);
+        }
+        for (MenuButton menu : subtitleTrackControls) {
+            populateTrackMenu(menu, subtitleTracks, false);
+        }
+    }
+
+    private void populateTrackMenu(MenuButton menu, List<MediaTrack> tracks, boolean audio) {
+        menu.getItems().clear();
+        if (backendPlayer == null) {
+            menu.setDisable(true);
+            return;
+        }
+        if (tracks.isEmpty()) {
+            MenuItem unavailable = new MenuItem(audio ? "Nenhuma faixa de áudio" : "Nenhuma legenda embutida");
+            unavailable.setDisable(true);
+            menu.getItems().add(unavailable);
+        } else {
+            for (MediaTrack track : tracks) {
+                MenuItem item = new MenuItem((track.selected() ? "✓ " : "") + track.label());
+                item.setOnAction(event -> selectTrack(track, audio));
+                menu.getItems().add(item);
+            }
+        }
+        if (!audio) {
+            menu.getItems().add(new SeparatorMenuItem());
+            MenuItem external = new MenuItem("Adicionar arquivo de legenda…");
+            external.setOnAction(event -> chooseExternalSubtitle());
+            menu.getItems().add(external);
+        }
+        menu.setDisable(audio && tracks.isEmpty());
+    }
+
+    private void selectTrack(MediaTrack track, boolean audio) {
+        MediaPlayerBackend player = backendPlayer;
+        if (player == null) return;
+        boolean selected = audio ? player.selectAudioTrack(track.id()) : player.selectSubtitleTrack(track.id());
+        if (!selected) {
+            status.setText("Não foi possível trocar a faixa selecionada.");
+            return;
+        }
+        refreshTrackControls();
+    }
+
+    private void chooseExternalSubtitle() {
+        MediaPlayerBackend player = backendPlayer;
+        if (player == null) return;
+        FileChooser chooser = new FileChooser();
+        chooser.setTitle("Selecionar legenda externa");
+        chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("Legendas", "*.srt", "*.ass", "*.ssa", "*.vtt"));
+        java.io.File subtitle = chooser.showOpenDialog(fullscreenPlayerStage == null ? primaryStage : fullscreenPlayerStage);
+        if (subtitle == null) return;
+        if (player.setExternalSubtitle(subtitle.toPath().toUri())) {
+            status.setText("Legenda externa adicionada.");
+            refreshTrackControls();
+        } else {
+            status.setText("Não foi possível adicionar esta legenda.");
         }
     }
     private void togglePlayerFullscreen() {
@@ -361,6 +456,8 @@ public final class LufiApplication extends Application {
         playbackTimeLabels.removeIf(label -> label.getScene() == null);
         volumeControls.removeIf(control -> control.getScene() == null);
         muteControls.removeIf(control -> control.getScene() == null);
+        audioTrackControls.removeIf(control -> control.getScene() == null);
+        subtitleTrackControls.removeIf(control -> control.getScene() == null);
         mediaView.setVisible(backendPlayer == null); backendVideoSurface.setVisible(backendPlayer != null); revealControls();
     }
     private Tab libraryTab() {
@@ -894,6 +991,7 @@ public final class LufiApplication extends Application {
         streamingMediaPlaybackGeneration = -1L;
         backendVideoSurface.getChildren().clear();
         backendVideoSurface.setVisible(false);
+        refreshTrackControls();
         return generation;
     }
 
@@ -933,6 +1031,7 @@ public final class LufiApplication extends Application {
                 nowPlaying.setText("Reproduzindo: " + videoName);
                 status.setText("Reproduzindo “" + videoName + "”.");
                 torrents.setForegroundPlaybackActive(true);
+                refreshTrackControls();
             }
             case PAUSED -> status.setText("Reprodução pausada.");
             case STOPPED -> {

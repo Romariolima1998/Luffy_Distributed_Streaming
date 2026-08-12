@@ -12,5 +12,8 @@
 .split-pane-divider { -fx-background-color: #303342; -fx-padding: 0 1 0 1; }
 .library-panel, .content-panel, .link-panel { -fx-background-color: #1a1c26; -fx-background-radius: 10; -fx-padding: 14; }
 .panel-title { -fx-font-size: 13px; -fx-font-weight: 700; -fx-text-fill: #a78bfa; } .library-name { -fx-font-size: 18px; -fx-font-weight: 700; }
-.player-controls { -fx-background-color: rgba(18, 19, 26, 0.92); -fx-background-radius: 10; -fx-padding: 10 14 10 14; }
+.player-controls { -fx-background-color: rgba(18, 19, 26, 0.92); -fx-background-radius: 10; -fx-padding: 10 14 10 14; -fx-max-width: 680; }
+.player-controls-top { -fx-min-width: 360; } .player-controls-bottom { -fx-min-width: 360; }
+.player-command { -fx-min-width: 38; -fx-min-height: 32; -fx-padding: 4 9 4 9; -fx-font-size: 16px; -fx-font-family: "Segoe UI Emoji", "Segoe UI", sans-serif; }
+.player-track { -fx-font-size: 15px; } .player-track .arrow { -fx-background-color: white; }
 .player-exit { -fx-background-color: rgba(18, 19, 26, 0.92); -fx-padding: 10 14 10 14; }
