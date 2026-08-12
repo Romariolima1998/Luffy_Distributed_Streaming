@@ -212,9 +212,15 @@ public final class LufiApplication extends Application {
         open.setOnAction(e -> askWatchMode(magnet.getText()));
         Label heading = new Label("Assistir"); heading.getStyleClass().add("section-title");
         Label hint = new Label("A reprodução começa quando o buffer de segurança estiver disponível."); hint.getStyleClass().add("muted");
-        Label playlistTitle = new Label("Vídeos da pasta compartilhada"); playlistTitle.getStyleClass().add("panel-title");
-        watchPlaylist.setPlaceholder(new Label("Abra um magnet para carregar a pasta."));
-        watchPlaylist.setOnMouseClicked(event -> { if (event.getClickCount() == 2 && watchPlaylist.getSelectionModel().getSelectedItem() != null) openWatchEntry(watchPlaylist.getSelectionModel().getSelectedItem()); });
+        Label playlistTitle = new Label("Arquivos do torrent"); playlistTitle.getStyleClass().add("panel-title");
+        watchPlaylist.setPlaceholder(new Label("Abra um magnet para carregar os arquivos."));
+        // Escolher um item é a autorização explícita para começar o download dele.
+        watchPlaylist.setOnMouseClicked(event -> {
+            if (event.getButton() == MouseButton.PRIMARY && event.getClickCount() == 1
+                    && watchPlaylist.getSelectionModel().getSelectedItem() != null) {
+                openWatchEntry(watchPlaylist.getSelectionModel().getSelectedItem());
+            }
+        });
         VBox playlist = new VBox(10, playlistTitle, watchPlaylist); playlist.getStyleClass().add("library-panel"); playlist.setMinWidth(300); VBox.setVgrow(watchPlaylist, Priority.ALWAYS);
         SplitPane playback = new SplitPane(playerSurface(), playlist); playback.setDividerPositions(.60);
         VBox box = new VBox(16, heading, hint, new HBox(10, magnet, open), status, playback); box.setPadding(new Insets(24));
@@ -707,15 +713,18 @@ public final class LufiApplication extends Application {
             activeWatchInfoHash = magnet.infoHash();
             pendingWatchPath = null;
             selectedStreamingPath = null;
-            streamingRequest.incrementAndGet();
+            long metadataRequest = streamingRequest.incrementAndGet();
             List<String> manifest = LuffyManifest.decode(magnet);
             if (mode == WatchMode.TEMPORARY && !manifest.isEmpty()) {
-                watchPlaylist.getItems().setAll(manifest.stream().map(path -> new WatchEntry(Path.of(path).getFileName().toString(), path, null)).toList());
-                status.setText("Escolha um vídeo para iniciar o streaming. Nenhuma pasta será baixada.");
+                watchPlaylist.getItems().setAll(manifest.stream()
+                        .map(path -> watchEntry(Path.of(path).getFileName().toString(), path, null)).toList());
+                status.setText("Arquivos recebidos. Clique em uma música ou vídeo para iniciar somente esse arquivo; nada foi baixado ainda.");
                 return;
             }
-            StreamingSession session = watchVideo.execute(raw, mode, content -> Platform.runLater(() -> onTorrentMetadata(content, raw, mode)));
-            status.setText("Buscando peers no DHT para “" + session.title() + "”. O download sequencial começou.");
+            StreamingSession session = watchVideo.execute(raw, mode, content -> Platform.runLater(() -> {
+                if (isCurrentWatchMetadata(metadataRequest, magnet.infoHash())) onTorrentMetadata(content, raw, mode);
+            }));
+            status.setText("Buscando os metadados de “" + session.title() + "”. Nenhum arquivo será baixado antes da sua escolha.");
             torrents.checkDhtReachability();
         } catch (IllegalArgumentException ex) { status.setText(ex.getMessage()); }
     }
@@ -736,25 +745,37 @@ public final class LufiApplication extends Application {
     }
     private void onTorrentMetadata(TorrentContent content, String magnet, WatchMode mode) {
         Path folder = content.folder();
-        if (mode == WatchMode.SHARE) {
+        // A prévia de metadados de “Assistir e compartilhar” usa cache temporário.
+        // A pasta permanente só é criada após a escolha de um arquivo.
+        if (mode == WatchMode.SHARE && selectedStreamingPath != null) {
             LibraryRepository.Library saved = libraryRepository.save(folder, magnet, null);
             LibraryView library = new LibraryView(saved.name(), saved.path(), saved.magnet(), null, true);
             addOrReplaceLibrary(library);
             libraries.getSelectionModel().select(library);
-            status.setText("Pasta criada em Documentos\\Luffy. Baixando e semeando no mesmo magnet.");
         }
         showWatchPlaylist(content);
     }
+    /** Descarta metadados de uma sessão substituída antes que eles alterem a lista ou a pasta persistente. */
+    private boolean isCurrentWatchMetadata(long requestId, String infoHash) {
+        return streamingRequest.get() == requestId && activeWatchInfoHash != null
+                && activeWatchInfoHash.equalsIgnoreCase(infoHash);
+    }
     private void showWatchPlaylist(TorrentContent content) {
-        List<WatchEntry> entries = content.files().stream().filter(this::isVideoFile).map(path -> new WatchEntry(path.getFileName().toString(), content.folder().relativize(path).toString().replace('\\', '/'), path)).toList();
+        List<WatchEntry> entries = content.files().stream()
+                .map(path -> watchEntry(path.getFileName().toString(),
+                        content.folder().relativize(path).toString().replace('\\', '/'), path))
+                .toList();
         watchPlaylist.getItems().setAll(entries);
         if (entries.isEmpty()) loadWatchPlaylist(content.folder());
         else {
-            status.setText("Lista da pasta recebida. Clique duas vezes em um vídeo para assistir enquanto ele é baixado.");
+            status.setText(selectedStreamingPath == null
+                    ? "Lista de arquivos recebida. Clique em uma música, vídeo ou arquivo para baixar somente ele."
+                    : selectedFileStatus());
             if (pendingWatchPath != null) {
                 String requestedPath = pendingWatchPath;
                 pendingWatchPath = null;
                 entries.stream().filter(entry -> entry.relativePath().equals(requestedPath)).findFirst()
+                        .filter(WatchEntry::playableMedia)
                         .ifPresent(entry -> playStreaming(new FoundVideo(entry.name(), entry.path())));
             }
         }
@@ -764,9 +785,15 @@ public final class LufiApplication extends Application {
             try {
                 Files.createDirectories(folder);
                 for (int attempt = 0; attempt < 30; attempt++) {
-                    List<Path> found = new LocalVideoScanner().scan(folder);
+                    List<Path> found = listAllFiles(folder);
                     if (!found.isEmpty()) {
-                        Platform.runLater(() -> { watchPlaylist.getItems().setAll(found.stream().map(path -> new WatchEntry(path.getFileName().toString(), folder.relativize(path).toString().replace('\\', '/'), path)).toList()); status.setText("Selecione um vídeo da pasta para assistir enquanto o download continua."); });
+                        Platform.runLater(() -> {
+                            watchPlaylist.getItems().setAll(found.stream().map(path -> watchEntry(path.getFileName().toString(),
+                                    folder.relativize(path).toString().replace('\\', '/'), path)).toList());
+                            status.setText(selectedStreamingPath == null
+                                    ? "Lista de arquivos recebida. Clique em um arquivo para baixar somente ele."
+                                    : selectedFileStatus());
+                        });
                         return;
                     }
                     Thread.sleep(2_000);
@@ -775,25 +802,53 @@ public final class LufiApplication extends Application {
             } catch (Exception error) { Platform.runLater(() -> status.setText("Não foi possível preparar a lista de vídeos recebidos.")); }
         });
     }
+    private List<Path> listAllFiles(Path folder) throws java.io.IOException {
+        try (var paths = Files.walk(folder)) {
+            return paths.filter(Files::isRegularFile).toList();
+        }
+    }
+    private WatchEntry watchEntry(String name, String relativePath, Path path) {
+        return new WatchEntry(name, relativePath, path, isPlayableMedia(name));
+    }
+    private boolean isPlayableMedia(String name) {
+        String normalized = name.toLowerCase(java.util.Locale.ROOT);
+        return List.of(".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".mts", ".wmv", ".flv", ".3gp", ".ogv", ".vob", ".asf",
+                ".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".aiff", ".aif", ".alac", ".ac3", ".eac3", ".dts")
+                .stream().anyMatch(normalized::endsWith);
+    }
     private boolean isVideoFile(Path path) {
         String name = path.getFileName().toString().toLowerCase();
         return List.of(".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".mts", ".wmv", ".flv", ".3gp", ".ogv", ".vob", ".asf").stream().anyMatch(name::endsWith);
     }
+    private String selectedFileStatus() {
+        return watchContext != null && watchContext.mode() == WatchMode.SHARE
+                ? "Baixando e compartilhando somente o arquivo selecionado em Documentos\\Luffy."
+                : "Baixando temporariamente somente o arquivo selecionado para reprodução.";
+    }
     private void openWatchEntry(WatchEntry entry) {
-        if (watchContext == null) { status.setText("Cole um magnet antes de escolher um vídeo."); return; }
-        if (watchContext.mode() == WatchMode.SHARE) {
-            if (entry.path() != null) playStreaming(new FoundVideo(entry.name(), entry.path()));
+        if (watchContext == null) { status.setText("Cole um magnet antes de escolher um arquivo."); return; }
+        if (watchContext.mode() == WatchMode.TEMPORARY && !entry.playableMedia()) {
+            status.setText("“Assistir apenas” baixa somente músicas e vídeos. Para baixar este arquivo, escolha “Assistir e compartilhar”.");
             return;
         }
         if (entry.relativePath().equals(selectedStreamingPath) && entry.path() != null) {
-            playStreaming(new FoundVideo(entry.name(), entry.path()));
+            if (entry.playableMedia()) playStreaming(new FoundVideo(entry.name(), entry.path()));
+            else status.setText("Este arquivo já é o download selecionado.");
             return;
         }
         selectedStreamingPath = entry.relativePath();
-        pendingWatchPath = entry.relativePath();
-        streamingRequest.incrementAndGet();
-        status.setText("Buscando peers para o vídeo selecionado. Apenas este arquivo será recebido temporariamente.");
-        try { watchVideo.execute(watchContext.magnet(), watchContext.mode(), entry.relativePath(), content -> Platform.runLater(() -> onTorrentMetadata(content, watchContext.magnet(), watchContext.mode()))); }
+        pendingWatchPath = entry.playableMedia() ? entry.relativePath() : null;
+        long metadataRequest = streamingRequest.incrementAndGet();
+        WatchContext context = watchContext;
+        String contextInfoHash = activeWatchInfoHash;
+        status.setText(entry.playableMedia()
+                ? "Buscando peers para a mídia selecionada. Apenas este arquivo será baixado."
+                : "Buscando peers para o arquivo selecionado. Apenas este arquivo será baixado.");
+        try { watchVideo.execute(context.magnet(), context.mode(), entry.relativePath(), content -> Platform.runLater(() -> {
+            if (isCurrentWatchMetadata(metadataRequest, contextInfoHash)) {
+                onTorrentMetadata(content, context.magnet(), context.mode());
+            }
+        })); }
         catch (IllegalArgumentException error) { status.setText(error.getMessage()); }
     }
     private void selectLibrary() {
@@ -1345,7 +1400,9 @@ public final class LufiApplication extends Application {
         }
     }
     private record FoundVideo(String name, Path path) { @Override public String toString() { return name; } }
-    private record WatchEntry(String name, String relativePath, Path path) { @Override public String toString() { return name; } }
+    private record WatchEntry(String name, String relativePath, Path path, boolean playableMedia) {
+        @Override public String toString() { return (playableMedia ? "▶ " : "📄 ") + name; }
+    }
     private record WatchContext(String magnet, WatchMode mode) { }
     private record LibraryNode(String name, Path path, boolean video) {
         @Override public String toString() { return (video ? "▶ " : "📁 ") + name; }

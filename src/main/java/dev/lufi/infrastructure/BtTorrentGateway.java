@@ -803,7 +803,6 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         return open(magnet, mode, null, onMetadata);
     }
     @Override public StreamingSession open(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
-        if (mode == WatchMode.SHARE) sharedTorrentDirectory(magnet);
         Path localSource = publishedRoots.get(magnet.infoHash());
         if (localSource != null) onMetadata.accept(new TorrentContent(localSource, listFiles(localSource)));
         else restartDownload(magnet, mode, selectedRelativePath, onMetadata);
@@ -828,9 +827,9 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         // inicialmente SKIP. É essencial aguardar o cliente antigo terminar antes
         // de criar a sessão selecionada, ou a runtime reutiliza o estado de SKIP e
         // conclui o novo cliente sem solicitar nenhuma peça.
-        if (mode == WatchMode.TEMPORARY && selectedRelativePath != null && previous != null
+        if (selectedRelativePath != null && previous != null
                 && sessions.remove(magnet.infoHash(), previous)) {
-            scheduleSelectedStreamingRestart(magnet, selectedRelativePath, onMetadata, previous);
+            scheduleSelectedDownloadRestart(magnet, mode, selectedRelativePath, onMetadata, previous);
             return;
         }
         if (previous != null && sessions.remove(magnet.infoHash(), previous)) {
@@ -850,14 +849,14 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
      * da mesma BtRuntime. Criar o segundo BtClient antes da conclusão do primeiro
      * preserva o mapa de peças SKIP do cliente anterior dentro do bt-core.
      */
-    private void scheduleSelectedStreamingRestart(MagnetLink magnet, String selectedRelativePath,
-                                                   Consumer<TorrentContent> onMetadata, BtClient previous) {
+    private void scheduleSelectedDownloadRestart(MagnetLink magnet, WatchMode mode, String selectedRelativePath,
+                                                  Consumer<TorrentContent> onMetadata, BtClient previous) {
         CompletableFuture<?> completion = clientProcessCompletions.get(previous);
         BtRuntime metadataPreviewRuntime = metadataPreviewRuntimes.remove(magnet.infoHash());
-        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT WAIT: infoHash=" + magnet.infoHash()
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE SESSION REPLACEMENT WAIT: infoHash=" + magnet.infoHash()
                 + "; selected=\"" + StreamingFileSelection.normalize(selectedRelativePath) + "\"; completionKnown="
                 + (completion != null) + ".");
-        statusListener.accept("Preparando o arquivo escolhido para streaming…");
+        statusListener.accept("Preparando o arquivo escolhido…");
         peerConnectivity.allowExplicitRetry(magnet.infoHash());
         holePunchAgent.allowExplicitRetry(magnet.infoHash());
         previous.stop();
@@ -865,15 +864,15 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         Runnable startReplacement = () -> {
             if (shuttingDown.get()) return;
             shutdownRuntime(metadataPreviewRuntime);
-            BtClient replacement = startDownload(magnet, WatchMode.TEMPORARY, selectedRelativePath, onMetadata);
+            BtClient replacement = startDownload(magnet, mode, selectedRelativePath, onMetadata);
             BtClient competing = sessions.putIfAbsent(magnet.infoHash(), replacement);
             if (competing != null) {
                 replacement.stop();
-                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT CANCELLED: infoHash="
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE SESSION REPLACEMENT CANCELLED: infoHash="
                         + magnet.infoHash() + "; uma sessão mais recente já está ativa.");
                 return;
             }
-            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SESSION REPLACEMENT STARTED: infoHash="
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE SESSION REPLACEMENT STARTED: infoHash="
                     + magnet.infoHash() + "; selected=\"" + StreamingFileSelection.normalize(selectedRelativePath) + "\".");
             registerMagnetPeerHint(magnet);
         };
@@ -931,8 +930,11 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
 
     private BtClient startDownload(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
-        Path target = mode == WatchMode.SHARE ? sharedTorrentDirectory(magnet) : temporaryDirectory();
-        boolean metadataOnly = mode == WatchMode.TEMPORARY && selectedRelativePath == null;
+        // Os dois modos começam sempre com todos os arquivos em SKIP. Assim obter
+        // metadados não cria uma pasta permanente nem transfere conteúdo algum.
+        boolean metadataOnly = selectedRelativePath == null;
+        Path target = metadataOnly ? temporaryDirectory()
+                : mode == WatchMode.SHARE ? sharedTorrentDirectory(magnet) : temporaryDirectory();
         BtRuntime activeRuntime = metadataOnly ? metadataPreviewRuntime(magnet.infoHash()) : runtime();
         attachTorrentDiagnostics(activeRuntime, magnet.infoHash(), "DOWNLOAD");
         AtomicInteger selectorCalls = new AtomicInteger();
@@ -950,7 +952,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             streamingPriorityWindows.remove(normalizeInfoHash(magnet.infoHash()));
         }
         AtomicReference<BtClient> clientReference = new AtomicReference<>();
-        PrioritizedPieceSelector streamingSelector = mode == WatchMode.TEMPORARY && selectedRelativePath != null
+        PrioritizedPieceSelector streamingSelector = selectedRelativePath != null
                 ? new PrioritizedPieceSelector(SequentialSelector.sequential()) : null;
         if (streamingSelector != null) streamingPieceSelectors.put(normalizeInfoHash(magnet.infoHash()), streamingSelector);
         var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target)).magnet(toUri(magnet));
@@ -961,15 +963,15 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                             torrent.getFiles().stream().map(file -> file.getPathElements()).toList());
                     Path folder = content.folder();
                     List<Path> files = content.files();
-                    if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
+                    if (selectedRelativePath != null) {
                         boolean found = torrent.getFiles().stream().anyMatch(file -> StreamingFileSelection.matches(selectedRelativePath, file.getPathElements()));
                         String torrentPaths = torrent.getFiles().stream().limit(8)
                                 .map(file -> StreamingFileSelection.normalize(String.join("/", file.getPathElements())))
                                 .reduce((left, right) -> left + " | " + right).orElse("<nenhum>");
-                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM FILE SELECTION: requested=\""
+                        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE: requested=\""
                                 + StreamingFileSelection.normalize(selectedRelativePath) + "\"; matched=" + found
                                 + "; arquivos=" + torrent.getFiles().size() + "; paths=" + torrentPaths + ".");
-                        if (!found) statusListener.accept("O vídeo escolhido não foi encontrado nos metadados deste torrent.");
+                        if (!found) statusListener.accept("O arquivo escolhido não foi encontrado nos metadados deste torrent.");
                     }
                     // The loopback media bridge needs a descriptor for every file
                     // that the UI can open. Shared downloads can still be partial,
@@ -979,33 +981,31 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                     }
                     onMetadata.accept(content);
                 });
-        if (mode == WatchMode.TEMPORARY) {
-            // Primeiro buscamos apenas os metadados e mostramos a lista. Depois do clique
-            // do usuário uma nova sessão prioriza exclusivamente o arquivo escolhido.
-            builder.fileSelector(file -> {
-                boolean selected = StreamingFileSelection.matches(selectedRelativePath, file.getPathElements());
-                bt.torrent.fileselector.FilePriority priority = selected
-                        ? bt.torrent.fileselector.FilePriority.HIGH_PRIORITY
-                        : bt.torrent.fileselector.FilePriority.SKIP;
-                int invocation = selectorCalls.incrementAndGet();
-                if (selected) selectedFileCalls.incrementAndGet();
-                if (invocation <= 32) {
-                    diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SELECTOR DECISION: infoHash=" + magnet.infoHash()
-                            + "; invocation=" + invocation + "; requested=\""
-                            + StreamingFileSelection.normalize(selectedRelativePath) + "\"; candidate=\""
-                            + StreamingFileSelection.normalize(String.join("/", file.getPathElements())) + "\"; pathElements="
-                            + file.getPathElements().size() + "; selected=" + selected + "; priority=" + priority + ".");
-                } else if (invocation == 33) {
-                    diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM SELECTOR DECISION: demais decisões foram suprimidas após 32 arquivos.");
-                }
-                return priority;
-            });
-            if (selectedRelativePath != null) {
-                builder.afterFilesChosen(() -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
-                        "STREAM FILES CHOSEN CALLBACK: infoHash=" + magnet.infoHash() + "; selected=\""
-                                + StreamingFileSelection.normalize(selectedRelativePath) + "\"; selectorCalls="
-                                + selectorCalls.get() + "; selectedCalls=" + selectedFileCalls.get() + "."));
+        // O seletor é aplicado também ao modo de compartilhamento: nunca há um
+        // download implícito da pasta inteira. Apenas o arquivo clicado recebe prioridade.
+        builder.fileSelector(file -> {
+            boolean selected = StreamingFileSelection.matches(selectedRelativePath, file.getPathElements());
+            bt.torrent.fileselector.FilePriority priority = selected
+                    ? bt.torrent.fileselector.FilePriority.HIGH_PRIORITY
+                    : bt.torrent.fileselector.FilePriority.SKIP;
+            int invocation = selectorCalls.incrementAndGet();
+            if (selected) selectedFileCalls.incrementAndGet();
+            if (invocation <= 32) {
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE DECISION: infoHash=" + magnet.infoHash()
+                        + "; invocation=" + invocation + "; requested=\""
+                        + StreamingFileSelection.normalize(selectedRelativePath) + "\"; candidate=\""
+                        + StreamingFileSelection.normalize(String.join("/", file.getPathElements())) + "\"; pathElements="
+                        + file.getPathElements().size() + "; selected=" + selected + "; priority=" + priority + ".");
+            } else if (invocation == 33) {
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SELECTED FILE DECISION: demais decisões foram suprimidas após 32 arquivos.");
             }
+            return priority;
+        });
+        if (selectedRelativePath != null) {
+            builder.afterFilesChosen(() -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                    "SELECTED FILES CHOSEN: infoHash=" + magnet.infoHash() + "; selected=\""
+                            + StreamingFileSelection.normalize(selectedRelativePath) + "\"; selectorCalls="
+                            + selectorCalls.get() + "; selectedCalls=" + selectedFileCalls.get() + "."));
         }
         if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
             // O player pode ainda estar lendo o buffer quando o BitTorrent marca o
@@ -1013,8 +1013,12 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             // encerrar a reprodução, nunca automaticamente neste callback.
             builder.afterDownloaded(ignored -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
                     "STREAM DOWNLOAD COMPLETE: infoHash=" + magnet.infoHash() + "; sessão mantida para reprodução."));
-        } else if (mode == WatchMode.SHARE) {
-            builder.afterDownloaded(ignored -> markDownloadedSwarmAsSeed(magnet, clientReference.get()));
+        } else if (mode == WatchMode.SHARE && selectedRelativePath != null) {
+            // O cliente permanece aberto para compartilhar o arquivo selecionado,
+            // mas não promove todos os outros arquivos (que continuam em SKIP).
+            builder.afterDownloaded(ignored -> diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                    "SHARED SELECTED FILE COMPLETE: infoHash=" + magnet.infoHash() + "; selected=\""
+                            + StreamingFileSelection.normalize(selectedRelativePath) + "\"; sessão mantida para semear este arquivo."));
         }
         BtClient client = builder.build();
         clientReference.set(client);
@@ -2236,8 +2240,9 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         return new IllegalStateException("DHT lookup cancelled because Luffy is shutting down");
     }
     private void deleteTemporaryRoot(Path root) {
-        try (var paths = java.nio.file.Files.walk(root)) { paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> { try { java.nio.file.Files.deleteIfExists(path); } catch (java.io.IOException ignored) { } }); }
-        catch (java.io.IOException ignored) { }
+        TemporaryWatchCache.CleanupResult result = TemporaryWatchCache.delete(root);
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[WATCH CACHE] cleanup: root=" + root
+                + "; deletedEntries=" + result.deletedEntries() + "; removed=" + result.removed() + ".");
     }
     public record DiagnosticTestSource(String magnet, String infoHash, Path sourceFile, P2pDiagnosticScenario scenario) { }
     public record DiagnosticTestResult(Path receivedFile, boolean contentVerified, String content, String outcome, String detail) { }
