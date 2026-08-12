@@ -10,6 +10,9 @@ plugins {
 group = "dev.luffy"
 version = "0.1.0"
 val javafxVersion = "21.0.5"
+// vlcj 4.x e a linha estavel destinada ao VLC/libVLC 3.x. Nao usar vlcj 5.x
+// experimental nem VLC 4 nightly durante esta migracao.
+val vlcjVersion = "4.12.1"
 
 repositories { mavenCentral() }
 
@@ -34,9 +37,12 @@ dependencies {
     implementation("com.github.atomashpolskiy:bt-http-tracker-client:1.10")
     implementation("com.github.atomashpolskiy:bt-dht:1.10")
     implementation("com.offbynull.portmapper:portmapper:2.0.6")
-    // Decodificador FFmpeg integrado: permite MKV/HEVC sem exigir VLC instalado.
-    implementation("org.bytedeco:javacv:1.5.13")
-    implementation("org.bytedeco:ffmpeg-platform:8.0.1-1.5.13")
+    // Backend libVLC isolado pela MediaPlayerBackend. O VLC nativo continua
+    // sendo descoberto em tempo de execucao e nao e empacotado pelo Luffy.
+    implementation("uk.co.caprica:vlcj:$vlcjVersion")
+    // A superfície JavaFX é implementada no Luffy com CallbackVideoSurface e
+    // PixelBuffer. Isso evita a incompatibilidade binária do vlcj-javafx
+    // publicado com a assinatura de RenderCallback do vlcj 4.12.x.
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
 
@@ -170,23 +176,28 @@ tasks.register<Zip>("linuxDistributionZip") {
 
 tasks.register<Exec>("windowsAppImage") {
     group = "distribution"
-    description = "Gera a pasta Windows com Luffy.exe para uma regra de firewall exclusiva do aplicativo."
+    description = "Gera uma pasta Windows isolada com Luffy.exe para uma regra de firewall exclusiva do aplicativo."
     val executableJar = tasks.named<Jar>("executableJar")
+    val appImageDestination = providers.gradleProperty("windowsAppImageDestination")
+        .map { file(it) }
+        .orElse(layout.buildDirectory.dir("windows").map { it.asFile })
     dependsOn(executableJar)
     inputs.file(executableJar.flatMap { it.archiveFile })
-    doFirst { delete(layout.buildDirectory.dir("windows/Luffy")) }
+    // Uma versao em uso no Windows nao pode ser apagada. A propriedade permite
+    // publicar uma imagem nova sem interferir em um Luffy.exe aberto.
+    doFirst { delete(appImageDestination.get().resolve("Luffy")) }
     val jpackage = javaToolchains.launcherFor {
         languageVersion.set(JavaLanguageVersion.of(21))
     }.get().metadata.installationPath.file("bin/jpackage.exe").asFile
     executable = jpackage.absolutePath
     args(
         "--type", "app-image",
-        "--dest", layout.buildDirectory.dir("windows").get().asFile.absolutePath,
+        "--dest", appImageDestination.get().absolutePath,
         "--input", layout.buildDirectory.dir("libs").get().asFile.absolutePath,
         "--name", "Luffy",
         "--main-jar", "Luffy-0.1.0-all.jar",
         "--main-class", "dev.lufi.ui.LuffyLauncher",
         "--java-options", "-Dfile.encoding=UTF-8"
     )
-    outputs.dir(layout.buildDirectory.dir("windows/Luffy"))
+    outputs.dir(appImageDestination.map { it.resolve("Luffy") })
 }

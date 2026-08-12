@@ -37,6 +37,18 @@ class StreamingPiecePrefixTrackerTest {
         assertEquals(0, tracker.contiguousPrefix("abc", 100));
     }
 
+    @Test void considersARangeAvailableOnlyWhenEveryOwningPieceWasVerified() {
+        StreamingPiecePrefixTracker tracker = new StreamingPiecePrefixTracker();
+        tracker.record("abc", 4);
+        tracker.record("abc", 6);
+
+        assertFalse(tracker.containsAll("abc", 4, 6));
+        assertFalse(tracker.containsAll("abc", 3, 4));
+
+        tracker.record("abc", 5);
+        assertTrue(tracker.containsAll("abc", 4, 6));
+    }
+
     @Test void waitsForTheEntireConfiguredContinuousStartupBuffer() {
         var scattered = new BtTorrentGateway.StreamingBufferStatus(30_000_000, 24, 4, 1_385, 24, true);
         var contiguous = new BtTorrentGateway.StreamingBufferStatus(30_000_000, 24, 24, 1_385, 24, true);

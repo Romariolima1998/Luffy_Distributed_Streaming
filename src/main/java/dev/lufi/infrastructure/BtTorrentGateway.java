@@ -12,6 +12,8 @@ import bt.net.InetPeer;
 import bt.net.Peer;
 import bt.peer.IPeerRegistry;
 import bt.peerexchange.PeerExchangeModule;
+import bt.torrent.selector.PrioritizedPieceSelector;
+import bt.torrent.selector.SequentialSelector;
 import dev.lufi.application.port.TorrentGateway;
 import dev.lufi.application.port.TorrentContent;
 import dev.lufi.domain.MagnetLink;
@@ -108,6 +110,12 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** O papel pode mudar de participação passiva para download sem duplicar os listeners do torrent. */
     private final Map<String, String> torrentDiagnosticRoles = new ConcurrentHashMap<>();
     private final Map<String, TransferSnapshot> transferSnapshots = new ConcurrentHashMap<>();
+    private final Map<String, StreamingMediaFile> streamingMediaFiles = new ConcurrentHashMap<>();
+    /** Seletores da sessao de streaming: faixa HTTP atual e seu read-ahead ganham precedencia. */
+    private final Map<String, PrioritizedPieceSelector> streamingPieceSelectors = new ConcurrentHashMap<>();
+    /** Janela ativa por torrent; uma nova janela substitui a prioridade anterior. */
+    private final Map<String, StreamingPriorityWindow> streamingPriorityWindows = new ConcurrentHashMap<>();
+    private volatile StreamingReadAheadPolicy streamingReadAheadPolicy = StreamingReadAheadPolicy.defaults();
     /** Peças iniciais confirmadas por torrent; necessárias antes de entregar um arquivo pré-alocado ao player. */
     private final StreamingPiecePrefixTracker streamingPiecePrefixes = new StreamingPiecePrefixTracker();
     private final PeerConnectivityManager peerConnectivity;
@@ -286,6 +294,108 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         int contiguousPrefix = streamingPiecePrefixes.contiguousPrefix(infoHash, snapshot.piecesTotal());
         return new StreamingBufferStatus(snapshot.downloaded(), snapshot.piecesComplete(), contiguousPrefix,
                 snapshot.piecesTotal(), required, active);
+    }
+
+    /**
+     * Read-only availability of a streamed file. This only reports bytes backed by
+     * verified pieces; it never changes peer selection or piece priority.
+     */
+    public StreamingMediaWindow streamingMediaWindow(String infoHash, Path file) {
+        if (infoHash == null || infoHash.isBlank() || file == null) return StreamingMediaWindow.unavailable();
+        StreamingMediaFile mediaFile = streamingMediaFiles.get(streamingMediaKey(infoHash, file));
+        boolean active = isTorrentSessionActive(infoHash);
+        if (mediaFile == null) return new StreamingMediaWindow(0, 0, active);
+        TransferSnapshot snapshot = transferSnapshots.get(infoHash.toLowerCase());
+        if (snapshot == null || snapshot.piecesTotal() <= 0) {
+            return new StreamingMediaWindow(mediaFile.lengthBytes(), 0, active);
+        }
+        int prefixPieces = streamingPiecePrefixes.contiguousPrefix(infoHash, snapshot.piecesTotal());
+        long verifiedTorrentBytes = Math.min(mediaFile.torrentLengthBytes(),
+                saturatedMultiply(prefixPieces, mediaFile.pieceLengthBytes()));
+        long verifiedFileBytes = Math.max(0,
+                Math.min(mediaFile.lengthBytes(), verifiedTorrentBytes - mediaFile.offsetBytes()));
+        return new StreamingMediaWindow(mediaFile.lengthBytes(), verifiedFileBytes, active);
+    }
+
+    /** Maps one HTTP byte range of a selected file to its owning torrent pieces. */
+    public Optional<StreamingPieceRange> streamingPiecesForRange(String infoHash, Path file,
+                                                                  long fileStartByte, long fileEndByte) {
+        if (infoHash == null || infoHash.isBlank() || file == null) return Optional.empty();
+        StreamingMediaFile mediaFile = streamingMediaFiles.get(streamingMediaKey(infoHash, file));
+        if (mediaFile == null) return Optional.empty();
+        return StreamingPieceRangeMapper.map(mediaFile.torrentLengthBytes(), mediaFile.offsetBytes(),
+                mediaFile.lengthBytes(), mediaFile.pieceLengthBytes(), fileStartByte, fileEndByte);
+    }
+
+    /** Progress of the pieces that own one HTTP range; used only by the local media bridge. */
+    public Optional<StreamingRangeProgress> streamingRangeProgress(String infoHash, Path file,
+                                                                    long fileStartByte, long fileEndByte) {
+        Optional<StreamingPieceRange> mapped = streamingPiecesForRange(infoHash, file, fileStartByte, fileEndByte);
+        if (mapped.isEmpty()) return Optional.empty();
+        StreamingPieceRange range = mapped.get();
+        int required = range.endPiece() - range.startPiece() + 1;
+        int ready = streamingPiecePrefixes.countVerified(infoHash, range.startPiece(), range.endPiece());
+        return Optional.of(new StreamingRangeProgress(required, ready));
+    }
+
+    /**
+     * Gives the active HTTP range and its bounded read-ahead precedence over
+     * the sequential fallback. It does not alter discovery, peers, transports
+     * or piece verification; bt-core still validates every piece hash.
+     */
+    public void prioritizeStreamingRange(String infoHash, Path file, long fileStartByte, long fileEndByte) {
+        Optional<StreamingPieceRange> mapped = streamingPiecesForRange(infoHash, file, fileStartByte, fileEndByte);
+        if (mapped.isEmpty()) return;
+        StreamingPieceRange range = mapped.get();
+        PrioritizedPieceSelector selector = streamingPieceSelectors.get(normalizeInfoHash(infoHash));
+        if (selector == null) return;
+        StreamingMediaFile mediaFile = streamingMediaFiles.get(streamingMediaKey(infoHash, file));
+        if (mediaFile == null) return;
+        int totalPieces = totalPieces(mediaFile);
+        int verifiedPrefixPieces = streamingPiecePrefixes.contiguousPrefix(infoHash, totalPieces);
+        StreamingPriorityWindow current = StreamingPriorityWindow.forStreamingRequest(range, totalPieces,
+                verifiedPrefixPieces, streamingReadAheadPolicy);
+        StreamingPriorityWindow previous = streamingPriorityWindows.put(normalizeInfoHash(infoHash), current);
+        // setHighPriorityPieces troca o BitSet inteiro de forma atômica no bt-core:
+        // pieces da posição anterior voltam imediatamente ao seletor sequencial.
+        selector.setHighPriorityPieces(current.pieces());
+        int piecesReady = streamingPiecePrefixes.countVerified(infoHash, range.startPiece(), range.endPiece());
+        String requestKind = current.isSeekFrom(previous) ? "SEEK" : "READ";
+        String priorityMode = current.priorityStartPiece() == range.startPiece() ? "REQUEST" : "PREFIX_FRONTIER";
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[STREAM-PRIORITY] requestedPiece=" + range.startPiece()
+                + "; requestedEndPiece=" + range.endPiece()
+                + "; priorityStartPiece=" + current.priorityStartPiece()
+                + "; priorityEndPiece=" + current.priorityEndPiece()
+                + "; priorityMode=" + priorityMode
+                + "; request=" + requestKind
+                + "; prefixPieces=" + verifiedPrefixPieces
+                + "; piecesReady=" + piecesReady + ".");
+        if (requestKind.equals("SEEK") && previous != null) {
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM HTTP SEEK PRIORITY SHIFT: infoHash=" + infoHash
+                    + "; previousPieces=" + previous.priorityStartPiece() + "-" + previous.priorityEndPiece()
+                    + "; currentPieces=" + current.priorityStartPiece() + "-" + current.priorityEndPiece()
+                    + "; oldPriority=cleared.");
+        }
+    }
+
+    /** Ajusta o read-ahead das próximas solicitações HTTP de streaming. */
+    public void setStreamingReadAheadPolicy(StreamingReadAheadPolicy policy) {
+        streamingReadAheadPolicy = Objects.requireNonNull(policy, "policy");
+    }
+
+    public StreamingReadAheadPolicy streamingReadAheadPolicy() {
+        return streamingReadAheadPolicy;
+    }
+
+    /**
+     * True only when every owning piece of this file byte range emitted a
+     * bt-core piece-verified event. File allocation and downloaded byte counts
+     * are intentionally not considered proof of availability here.
+     */
+    public boolean isStreamingFileRangeVerified(String infoHash, Path file, long fileStartByte, long fileEndByte) {
+        Optional<StreamingPieceRange> mapped = streamingPiecesForRange(infoHash, file, fileStartByte, fileEndByte);
+        return mapped.isPresent() && streamingPiecePrefixes.containsAll(infoHash,
+                mapped.get().startPiece(), mapped.get().endPiece());
     }
     /** Atualiza somente os guardrails de abuso; conexoes BitTorrent estabelecidas nao sao tocadas. */
     public void setAbuseProtectionConfig(AbuseProtectionConfig config) {
@@ -753,10 +863,18 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         if (!metadataOnly) {
             transferSnapshots.remove(magnet.infoHash().toLowerCase());
             streamingPiecePrefixes.clear(magnet.infoHash());
+            clearStreamingMediaFiles(magnet.infoHash());
+            streamingPieceSelectors.remove(normalizeInfoHash(magnet.infoHash()));
+            streamingPriorityWindows.remove(normalizeInfoHash(magnet.infoHash()));
         }
         AtomicReference<BtClient> clientReference = new AtomicReference<>();
-        var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target))
-                .magnet(toUri(magnet)).sequentialSelector().afterTorrentFetched(torrent -> {
+        PrioritizedPieceSelector streamingSelector = mode == WatchMode.TEMPORARY && selectedRelativePath != null
+                ? new PrioritizedPieceSelector(SequentialSelector.sequential()) : null;
+        if (streamingSelector != null) streamingPieceSelectors.put(normalizeInfoHash(magnet.infoHash()), streamingSelector);
+        var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target)).magnet(toUri(magnet));
+        if (streamingSelector == null) builder.sequentialSelector();
+        else builder.selector(streamingSelector);
+        builder.afterTorrentFetched(torrent -> {
                     TorrentContent content = StreamingTorrentContentLayout.resolve(target, torrent.getName(),
                             torrent.getFiles().stream().map(file -> file.getPathElements()).toList());
                     Path folder = content.folder();
@@ -770,6 +888,9 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                                 + StreamingFileSelection.normalize(selectedRelativePath) + "\"; matched=" + found
                                 + "; arquivos=" + torrent.getFiles().size() + "; paths=" + torrentPaths + ".");
                         if (!found) statusListener.accept("O vídeo escolhido não foi encontrado nos metadados deste torrent.");
+                    }
+                    if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
+                        registerStreamingMediaFile(magnet.infoHash(), torrent, content, selectedRelativePath);
                     }
                     onMetadata.accept(content);
                 });
@@ -816,6 +937,49 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         if (metadataOnly) connectKnownTcpPeersToMetadataPreview(magnet.infoHash(), activeRuntime);
         reportMissingMetadataAfterDelay(magnet, client);
         return client;
+    }
+
+    private void registerStreamingMediaFile(String infoHash, bt.metainfo.Torrent torrent,
+                                            TorrentContent content, String selectedRelativePath) {
+        long offset = 0;
+        List<bt.metainfo.TorrentFile> files = torrent.getFiles();
+        List<Path> resolvedFiles = content.files();
+        for (int index = 0; index < files.size(); index++) {
+            bt.metainfo.TorrentFile torrentFile = files.get(index);
+            long length = torrentFile.getSize();
+            if (StreamingFileSelection.matches(selectedRelativePath, torrentFile.getPathElements())
+                    && index < resolvedFiles.size() && length > 0 && torrent.getChunkSize() > 0) {
+                Path resolved = resolvedFiles.get(index);
+                streamingMediaFiles.put(streamingMediaKey(infoHash, resolved), new StreamingMediaFile(
+                        torrent.getSize(), offset, length, torrent.getChunkSize()));
+                return;
+            }
+            offset += length;
+        }
+    }
+
+    private void clearStreamingMediaFiles(String infoHash) {
+        if (infoHash == null) return;
+        String prefix = normalizeInfoHash(infoHash) + "|";
+        streamingMediaFiles.keySet().removeIf(key -> key.startsWith(prefix));
+    }
+
+    private static String streamingMediaKey(String infoHash, Path file) {
+        return normalizeInfoHash(infoHash) + "|" + file.toAbsolutePath().normalize();
+    }
+
+    private static String normalizeInfoHash(String infoHash) {
+        return infoHash.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static long saturatedMultiply(long left, long right) {
+        if (left <= 0 || right <= 0) return 0;
+        return left > Long.MAX_VALUE / right ? Long.MAX_VALUE : left * right;
+    }
+
+    private static int totalPieces(StreamingMediaFile mediaFile) {
+        long total = Math.ceilDiv(mediaFile.torrentLengthBytes(), mediaFile.pieceLengthBytes());
+        return (int) Math.min(Integer.MAX_VALUE, total);
     }
 
     /**
@@ -1917,7 +2081,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         swarmAssistMaintenanceTasks.values().forEach(task -> task.cancel(false)); swarmAssistMaintenanceTasks.clear();
         swarmAssistReplenishTasks.values().forEach(task -> task.cancel(false)); swarmAssistReplenishTasks.clear();
         swarmAssistMaintenance.shutdownNow(); swarmAssistDhtScheduler.close();
-        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear(); streamingPiecePrefixes.clear();
+        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear(); streamingPiecePrefixes.clear(); streamingMediaFiles.clear(); streamingPieceSelectors.clear(); streamingPriorityWindows.clear();
         BtRuntime active = runtime; runtime = null; transferRuntimeDhtAnnounceEnabled = false; if (active != null) active.shutdown();
         BtRuntime activeIpv6 = ipv6Runtime; ipv6Runtime = null; if (activeIpv6 != null) activeIpv6.shutdown();
         utpBridge.close(); utpTransport = null;
@@ -1961,5 +2125,31 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             return new StreamingBufferStatus(0, 0, 0, 0, STREAM_STARTUP_PIECES, false);
         }
     }
+    /** Byte window that the localhost server may read without exposing unverified gaps. */
+    public record StreamingMediaWindow(long contentLengthBytes, long verifiedPrefixBytes, boolean sessionActive) {
+        public StreamingMediaWindow {
+            contentLengthBytes = Math.max(0, contentLengthBytes);
+            verifiedPrefixBytes = Math.max(0, Math.min(contentLengthBytes, verifiedPrefixBytes));
+        }
+        public boolean hasVerifiedBytesAt(long offset) {
+            return offset >= 0 && offset < verifiedPrefixBytes;
+        }
+        static StreamingMediaWindow unavailable() {
+            return new StreamingMediaWindow(0, 0, false);
+        }
+    }
+    /** Immutable description of all torrent pieces required by one file byte range. */
+    public record StreamingPieceRange(long fileStartByte, long fileEndByte,
+                                      long torrentStartByte, long torrentEndByte,
+                                      int startPiece, int endPiece,
+                                      long pieceLengthBytes, long endPieceLengthBytes,
+                                       boolean firstPiecePartial, boolean lastPiecePartial) { }
+    public record StreamingRangeProgress(int piecesRequired, int piecesReady) {
+        public StreamingRangeProgress {
+            piecesRequired = Math.max(0, piecesRequired);
+            piecesReady = Math.max(0, Math.min(piecesRequired, piecesReady));
+        }
+    }
     private record TransferSnapshot(long downloaded, int piecesRemaining, int piecesComplete, int piecesTotal) { }
+    private record StreamingMediaFile(long torrentLengthBytes, long offsetBytes, long lengthBytes, long pieceLengthBytes) { }
 }

@@ -30,6 +30,26 @@ final class StreamingPiecePrefixTracker {
         }
     }
 
+    /** Returns true only when every piece in the inclusive interval was hash-verified. */
+    boolean containsAll(String infoHash, int firstPiece, int lastPiece) {
+        if (infoHash == null || infoHash.isBlank() || firstPiece < 0 || lastPiece < firstPiece) return false;
+        BitSet verified = verifiedByInfoHash.get(normalize(infoHash));
+        if (verified == null) return false;
+        synchronized (verified) {
+            return verified.nextClearBit(firstPiece) > lastPiece;
+        }
+    }
+
+    /** Counts hash-verified pieces in the inclusive interval for streaming telemetry. */
+    int countVerified(String infoHash, int firstPiece, int lastPiece) {
+        if (infoHash == null || infoHash.isBlank() || firstPiece < 0 || lastPiece < firstPiece) return 0;
+        BitSet verified = verifiedByInfoHash.get(normalize(infoHash));
+        if (verified == null) return 0;
+        synchronized (verified) {
+            return verified.get(firstPiece, lastPiece + 1).cardinality();
+        }
+    }
+
     void clear(String infoHash) {
         if (infoHash != null) verifiedByInfoHash.remove(normalize(infoHash));
     }
