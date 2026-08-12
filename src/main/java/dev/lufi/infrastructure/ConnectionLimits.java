@@ -43,7 +43,7 @@ public record ConnectionLimits(
 
     public int categoryLimit(ConnectionRole role) {
         return switch (role) {
-            case STREAM, DOWNLOAD -> maxDownloadConnections;
+            case STREAM, DOWNLOAD, BACKGROUND_DOWNLOAD -> maxDownloadConnections;
             case SEED -> maxSeedConnections;
             case RENDEZVOUS, OVERLAY -> maxOverlayConnections;
             case ASSIST -> maxAssistConnections;
@@ -52,6 +52,12 @@ public record ConnectionLimits(
 
     /** Reserva uma vaga de aquisição para que um stream iniciado pelo usuário não fique atrás de downloads em lote. */
     public int streamReserveConnections() { return maxDownloadConnections > 1 ? 1 : 0; }
+
+    /**
+     * Download mantido em segundo plano não deve ocupar toda a janela que o
+     * magnet em primeiro plano precisa para montar seu buffer inicial.
+     */
+    public int backgroundDownloadConnections() { return Math.min(8, maxDownloadConnections); }
 
     private static void requirePositive(int value, String name) {
         if (value < 1) throw new IllegalArgumentException(name + " deve ser maior que zero");

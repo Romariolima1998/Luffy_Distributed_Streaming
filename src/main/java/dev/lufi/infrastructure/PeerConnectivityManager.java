@@ -699,6 +699,28 @@ public final class PeerConnectivityManager implements AutoCloseable {
         diagnostics.log("CONNECTIVITY: nova tentativa explícita liberada para infoHash=" + infoHash + ".");
     }
 
+    /**
+     * Descarta peers e tentativas pendentes de um torrent que deixou de ser
+     * assistido. Conexões vivas são fechadas pelo dono da sessão BitTorrent.
+     */
+    public void forgetTorrent(String infoHash) {
+        validateInfoHash(infoHash);
+        String prefix = infoHash.toLowerCase(Locale.ROOT) + "|";
+        ConnectionRace race = connectionRaces.remove(infoHash.toLowerCase(Locale.ROOT));
+        if (race != null) race.cancelAll().forEach(future -> future.cancel(false));
+        cancelTimersFor(prefix, connectTimers);
+        cancelTimersFor(prefix, retryTimers);
+        peers.entrySet().removeIf(entry -> entry.getKey().startsWith(prefix));
+    }
+
+    private static void cancelTimersFor(String keyPrefix, Map<String, ScheduledFuture<?>> timers) {
+        timers.entrySet().removeIf(entry -> {
+            if (!entry.getKey().startsWith(keyPrefix)) return false;
+            entry.getValue().cancel(false);
+            return true;
+        });
+    }
+
     public List<PeerState> peersFor(String infoHash) {
         List<PeerState> result = new ArrayList<>();
         peers.values().forEach(state -> { if (state.infoHash.equalsIgnoreCase(infoHash)) result.add(state.snapshot()); });

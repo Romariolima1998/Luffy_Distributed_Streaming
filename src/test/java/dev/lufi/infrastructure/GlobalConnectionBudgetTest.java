@@ -49,6 +49,38 @@ class GlobalConnectionBudgetTest {
         assertTrue(stream.admitted());
     }
 
+    @Test void foregroundMagnetCanReplaceBackgroundDownloadAtTheSharedCap() {
+        GlobalConnectionBudget budget = budget(new ConnectionLimits(3, 8, 2, 4, 8, 16));
+        List<GlobalConnectionBudget.Slot> occupied = List.of(
+                slot("background-1", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-2", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-3", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-4", ConnectionRole.BACKGROUND_DOWNLOAD));
+
+        var decision = budget.admit(ConnectionRole.STREAM, "new-foreground-stream", occupied);
+
+        assertTrue(decision.admitted());
+        assertEquals(GlobalConnectionBudget.AdmissionReason.PREEMPT_BACKGROUND, decision.reason());
+    }
+
+    @Test void backgroundDownloadsKeepOnlyASmallConnectionSlice() {
+        GlobalConnectionBudget budget = budget(new ConnectionLimits(3, 8, 2, 12, 8, 32));
+        List<GlobalConnectionBudget.Slot> occupied = List.of(
+                slot("background-1", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-2", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-3", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-4", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-5", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-6", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-7", ConnectionRole.BACKGROUND_DOWNLOAD),
+                slot("background-8", ConnectionRole.BACKGROUND_DOWNLOAD));
+
+        var decision = budget.admit(ConnectionRole.BACKGROUND_DOWNLOAD, "background-9", occupied);
+
+        assertFalse(decision.admitted());
+        assertEquals(GlobalConnectionBudget.AdmissionReason.BACKGROUND_LIMIT, decision.reason());
+    }
+
     @Test void preventsConnectionStormsWithThePendingBudget() {
         GlobalConnectionBudget budget = budget(new ConnectionLimits(3, 8, 2, 4, 2, 16));
         List<GlobalConnectionBudget.Slot> occupied = List.of(

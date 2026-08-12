@@ -149,6 +149,37 @@ class LuffyLocalMediaServerTest {
     }
 
     @Test
+    void waitsForTheMediaDescriptionInsteadOfReportingAnImmediateHttpFailure() throws Exception {
+        Path file = Files.createTempFile("luffy-local-media-description-", ".mkv");
+        byte[] content = "0123456789".getBytes();
+        Files.write(file, content);
+        AtomicReference<LuffyLocalMediaServer.VerifiedMediaWindow> window = new AtomicReference<>(
+                new LuffyLocalMediaServer.VerifiedMediaWindow(0, 0, true));
+        AtomicReference<PlayerErrorCode> errorCode = new AtomicReference<>();
+        LuffyLocalMediaServer server = new LuffyLocalMediaServer(new P2pDiagnostics(), Duration.ofMillis(25));
+        try {
+            TorrentStreamingMediaSource source = server.register(file, window::get,
+                    (start, end) -> { }, (start, end) -> true, (buffering, start, end) -> { },
+                    (start, end) -> LuffyLocalMediaServer.RangeProgress.unavailable(),
+                    (code, detail) -> errorCode.set(code));
+
+            var responseFuture = HttpClient.newHttpClient().sendAsync(head(source.uri(), null),
+                    HttpResponse.BodyHandlers.discarding());
+            Thread.sleep(100L);
+            assertFalse(responseFuture.isDone());
+
+            window.set(new LuffyLocalMediaServer.VerifiedMediaWindow(content.length, content.length, true));
+            HttpResponse<Void> response = responseFuture.get(2, TimeUnit.SECONDS);
+            assertEquals(200, response.statusCode());
+            assertEquals(Integer.toString(content.length), response.headers().firstValue("Content-Length").orElseThrow());
+            assertEquals(null, errorCode.get());
+        } finally {
+            server.close();
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
     void servesASoughtRangeOnlyAfterItsOwningPiecesAreVerified() throws Exception {
         Path file = Files.createTempFile("luffy-local-media-range-", ".mkv");
         byte[] content = "0123456789abcdefghijklmnopqrstuv".getBytes();

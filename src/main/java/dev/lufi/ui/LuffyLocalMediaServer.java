@@ -167,15 +167,16 @@ final class LuffyLocalMediaServer implements AutoCloseable {
                 exchange.sendResponseHeaders(404, -1);
                 return;
             }
-            VerifiedMediaWindow initial = registration.availability().get();
-            long contentLength = initial.contentLengthBytes();
-            if (contentLength <= 0) {
-                signalFailure(registration, PlayerErrorCode.HTTP_STREAM_FAILED,
-                        "o arquivo ainda não informou um tamanho utilizável");
+            VerifiedMediaWindow initial = awaitMediaDescription(registration);
+            if (initial == null) {
+                PlayerErrorCode code = registration.active() && registration.availability().get().sessionActive()
+                        ? PlayerErrorCode.HTTP_STREAM_FAILED : PlayerErrorCode.TORRENT_STOPPED;
+                signalFailure(registration, code, "a sessao de streaming foi encerrada antes de informar a midia");
                 exchange.getResponseHeaders().set("Retry-After", "1");
                 exchange.sendResponseHeaders(503, -1);
                 return;
             }
+            long contentLength = initial.contentLengthBytes();
             Headers headers = exchange.getResponseHeaders();
             headers.set("Accept-Ranges", "bytes");
             headers.set("Content-Type", mediaContentType(registration.file()));
@@ -258,6 +259,32 @@ final class LuffyLocalMediaServer implements AutoCloseable {
             }
         } finally {
             if (buffering) signalBuffering(registration, false, requiredExclusive - 1, requiredExclusive - 1);
+        }
+    }
+
+    /**
+     * A media engine may open the loopback URL just before the torrent publishes
+     * the file-to-piece mapping. That is ordinary buffering, not a container or
+     * decoder failure, so keep the HTTP request open while the session is alive.
+     */
+    private VerifiedMediaWindow awaitMediaDescription(Registration registration) {
+        boolean buffering = false;
+        try {
+            while (true) {
+                if (!registration.active()) return null;
+                VerifiedMediaWindow window = registration.availability().get();
+                if (window.contentLengthBytes() > 0) return window;
+                if (!buffering) {
+                    buffering = true;
+                    signalBuffering(registration, true, 0, 0);
+                    diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
+                            "[STREAM-HTTP] mediaDescription=WAIT; reason=content-length-unavailable.");
+                }
+                if (!window.sessionActive()) return null;
+                if (!waitForAvailability()) return null;
+            }
+        } finally {
+            if (buffering) signalBuffering(registration, false, 0, 0);
         }
     }
 

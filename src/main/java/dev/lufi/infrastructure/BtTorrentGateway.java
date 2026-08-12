@@ -77,7 +77,10 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     private static final Duration SWARM_ASSIST_REPLENISH_DELAY = Duration.ofSeconds(5);
     private static final Duration SWARM_ASSIST_PEX_FRESHNESS = Duration.ofMinutes(2);
     /** Margem inicial contínua antes de abrir um arquivo temporário no player. */
-    public static final int DEFAULT_STREAM_STARTUP_PIECES = 24;
+    public static final int DEFAULT_STREAM_STARTUP_PIECES = 15;
+
+    /** Resultado da troca entre magnets, exposto somente para a UI registrar o que ocorreu. */
+    public enum ForegroundWatchTransition { UNCHANGED, TEMPORARY_STOPPED, SHARE_DEMOTED }
     public static final int MIN_STREAM_STARTUP_PIECES = 1;
     public static final int MAX_STREAM_STARTUP_PIECES = 500;
     private final Path cacheDirectory;
@@ -459,6 +462,53 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         swarmAssistResourceGovernor.setForegroundPlayback(active);
         reconcileSwarmAssistResourcePriority();
     }
+
+    /**
+     * Libera o magnet anterior antes de abrir outro. Uma sessão temporária é
+     * cancelada por completo; um download compartilhado continua, mas perde a
+     * prioridade de conexões para o novo magnet.
+     */
+    public ForegroundWatchTransition transitionForegroundWatch(String previousInfoHash, WatchMode previousMode,
+                                                                String nextInfoHash) {
+        if (previousInfoHash == null || previousInfoHash.isBlank() || previousMode == null
+                || previousInfoHash.equalsIgnoreCase(nextInfoHash)) return ForegroundWatchTransition.UNCHANGED;
+        String infoHash = normalizeInfoHash(previousInfoHash);
+        if (previousMode == WatchMode.SHARE) {
+            boolean demoted = userTransferRoles.replace(infoHash, ConnectionRole.DOWNLOAD,
+                    ConnectionRole.BACKGROUND_DOWNLOAD);
+            if (demoted) {
+                trimBackgroundDownloadConnections();
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[WATCH] SESSION SWITCH: previousInfoHash=" + infoHash
+                        + "; nextInfoHash=" + nextInfoHash + "; action=DEMOTE_SHARED_DOWNLOAD; "
+                        + "backgroundConnectionLimit=" + connectionLimits().backgroundDownloadConnections() + ".");
+                return ForegroundWatchTransition.SHARE_DEMOTED;
+            }
+            return ForegroundWatchTransition.UNCHANGED;
+        }
+
+        clearStreamingPriority(infoHash);
+        BtClient client = sessions.remove(infoHash);
+        if (client != null) {
+            client.stop();
+            shutdownMetadataPreviewAfterClient(infoHash, client);
+        } else {
+            BtRuntime preview = metadataPreviewRuntimes.remove(infoHash);
+            if (preview != null) shutdownRuntime(preview);
+        }
+        closeAcceptedConnectionsFor(infoHash);
+        peerConnectivity.forgetTorrent(infoHash);
+        userTransferRoles.remove(infoHash);
+        swarmAssistResourceGovernor.completeUserDownload(infoHash);
+        reconcileSwarmAssistResourcePriority();
+        transferSnapshots.remove(infoHash);
+        streamingPiecePrefixes.clear(infoHash);
+        clearStreamingMediaFiles(infoHash);
+        streamingPieceSelectors.remove(infoHash);
+        streamingPriorityWindows.remove(infoHash);
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[WATCH] SESSION SWITCH: previousInfoHash=" + infoHash
+                + "; nextInfoHash=" + nextInfoHash + "; action=STOP_TEMPORARY; clientStopped=" + (client != null) + ".");
+        return ForegroundWatchTransition.TEMPORARY_STOPPED;
+    }
     public void setConnectivityProfile(ConnectivityProfile profile) {
         connectivity = profile == null ? ConnectivityProfile.unavailable() : profile;
         peerConnectivity.setLocalConnectivity(connectivity);
@@ -753,7 +803,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         return open(magnet, mode, null, onMetadata);
     }
     @Override public StreamingSession open(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
-        if (mode == WatchMode.SHARE) documentsLuffyDirectory();
+        if (mode == WatchMode.SHARE) sharedTorrentDirectory(magnet);
         Path localSource = publishedRoots.get(magnet.infoHash());
         if (localSource != null) onMetadata.accept(new TorrentContent(localSource, listFiles(localSource)));
         else restartDownload(magnet, mode, selectedRelativePath, onMetadata);
@@ -881,7 +931,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
 
     private BtClient startDownload(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
-        Path target = mode == WatchMode.SHARE ? documentsLuffyDirectory() : temporaryDirectory();
+        Path target = mode == WatchMode.SHARE ? sharedTorrentDirectory(magnet) : temporaryDirectory();
         boolean metadataOnly = mode == WatchMode.TEMPORARY && selectedRelativePath == null;
         BtRuntime activeRuntime = metadataOnly ? metadataPreviewRuntime(magnet.infoHash()) : runtime();
         attachTorrentDiagnostics(activeRuntime, magnet.infoHash(), "DOWNLOAD");
@@ -921,8 +971,11 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                                 + "; arquivos=" + torrent.getFiles().size() + "; paths=" + torrentPaths + ".");
                         if (!found) statusListener.accept("O vídeo escolhido não foi encontrado nos metadados deste torrent.");
                     }
-                    if (mode == WatchMode.TEMPORARY && selectedRelativePath != null) {
-                        registerStreamingMediaFile(magnet.infoHash(), torrent, content, selectedRelativePath);
+                    // The loopback media bridge needs a descriptor for every file
+                    // that the UI can open. Shared downloads can still be partial,
+                    // so they need the same mapping as temporary stream sessions.
+                    if (!metadataOnly) {
+                        registerStreamingMediaFiles(magnet.infoHash(), torrent, content);
                     }
                     onMetadata.accept(content);
                 });
@@ -971,23 +1024,25 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         return client;
     }
 
-    private void registerStreamingMediaFile(String infoHash, bt.metainfo.Torrent torrent,
-                                            TorrentContent content, String selectedRelativePath) {
+    private void registerStreamingMediaFiles(String infoHash, bt.metainfo.Torrent torrent,
+                                             TorrentContent content) {
         long offset = 0;
         List<bt.metainfo.TorrentFile> files = torrent.getFiles();
         List<Path> resolvedFiles = content.files();
+        int registered = 0;
         for (int index = 0; index < files.size(); index++) {
             bt.metainfo.TorrentFile torrentFile = files.get(index);
             long length = torrentFile.getSize();
-            if (StreamingFileSelection.matches(selectedRelativePath, torrentFile.getPathElements())
-                    && index < resolvedFiles.size() && length > 0 && torrent.getChunkSize() > 0) {
+            if (index < resolvedFiles.size() && length > 0 && torrent.getChunkSize() > 0) {
                 Path resolved = resolvedFiles.get(index);
                 streamingMediaFiles.put(streamingMediaKey(infoHash, resolved), new StreamingMediaFile(
                         torrent.getSize(), offset, length, torrent.getChunkSize()));
-                return;
+                registered++;
             }
             offset += length;
         }
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM MEDIA FILES REGISTERED: infoHash=" + infoHash
+                + "; files=" + registered + "/" + files.size() + "; root=" + content.folder() + ".");
     }
 
     private void clearStreamingMediaFiles(String infoHash) {
@@ -1416,9 +1471,37 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
 
     private int countConnectionRole(GlobalConnectionBudget.Snapshot snapshot, ConnectionRole role) {
-        if (role.isUserTransfer()) return snapshot.count(ConnectionRole.STREAM) + snapshot.count(ConnectionRole.DOWNLOAD);
+        if (role.isUserTransfer()) return snapshot.count(ConnectionRole.STREAM) + snapshot.count(ConnectionRole.DOWNLOAD)
+                + snapshot.count(ConnectionRole.BACKGROUND_DOWNLOAD);
         if (role.isOverlayControl()) return snapshot.count(ConnectionRole.RENDEZVOUS) + snapshot.count(ConnectionRole.OVERLAY);
         return snapshot.count(role);
+    }
+
+    /** Fecha conexões do torrent temporário que acabou de ser cancelado pelo usuário. */
+    private void closeAcceptedConnectionsFor(String infoHash) {
+        bootstrapPeerConnections.connectionKeys().stream()
+                .filter(key -> hex(key.getTorrentId()).equalsIgnoreCase(infoHash))
+                .forEach(bootstrapPeerConnections::close);
+    }
+
+    /** Mantém uma fatia pequena para downloads compartilhados que ficaram em segundo plano. */
+    private void trimBackgroundDownloadConnections() {
+        int limit = connectionLimits().backgroundDownloadConnections();
+        List<bt.net.ConnectionKey> background = bootstrapPeerConnections.connectionKeys().stream()
+                .filter(key -> {
+                    String infoHash = hex(key.getTorrentId());
+                    return connectionRoleFor(infoHash,
+                            strategyForAcceptedConnection(infoHash, key.getPeer(), key.getRemotePort()))
+                            == ConnectionRole.BACKGROUND_DOWNLOAD;
+                })
+                .sorted(java.util.Comparator.comparing(key -> bootstrapPeerConnections.acceptedAt(key).orElse(Instant.EPOCH),
+                        java.util.Comparator.reverseOrder()))
+                .toList();
+        int excess = Math.max(0, background.size() - limit);
+        if (excess == 0) return;
+        background.stream().limit(excess).forEach(bootstrapPeerConnections::close);
+        diagnostics.log(P2pDiagnostics.Layer.CONNECTIVITY, "[WATCH] BACKGROUND CONNECTIONS TRIMMED: closed=" + excess
+                + "; retained=" + limit + "; reason=NEW_FOREGROUND_MAGNET.");
     }
 
     private bt.net.ConnectionKey selectBudgetVictim(String incomingKey, ConnectionRole incomingRole, boolean categoryViolation) {
@@ -1965,6 +2048,19 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         Path directory = Path.of(System.getProperty("user.home"), "Documents", "Luffy");
         try { java.nio.file.Files.createDirectories(directory); return directory; }
         catch (java.io.IOException e) { throw new IllegalStateException("Não foi possível criar Documentos\\Luffy", e); }
+    }
+
+    /** The full info hash is the stable identity of a shared magnet download. */
+    private Path sharedTorrentDirectory(MagnetLink magnet) {
+        Path directory = SharedTorrentStorageLayout.resolve(documentsLuffyDirectory(), magnet);
+        try {
+            java.nio.file.Files.createDirectories(directory);
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "SHARED DOWNLOAD DIRECTORY: infoHash=" + magnet.infoHash()
+                    + "; path=" + directory + ".");
+            return directory;
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Não foi possível criar a pasta deste magnet em Documentos\\Luffy", e);
+        }
     }
     private Path temporaryDirectory() {
         try { Path directory = java.nio.file.Files.createTempDirectory("luffy-watch-"); temporaryRoots.add(directory); return directory; }

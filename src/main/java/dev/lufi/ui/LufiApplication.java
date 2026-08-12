@@ -224,9 +224,11 @@ public final class LufiApplication extends Application {
     private Tab settingsTab() {
         Label heading = new Label("Configurações"); heading.getStyleClass().add("section-title");
         Label title = new Label("Buffer inicial para streaming"); title.getStyleClass().add("panel-title");
-        Label recommendation = new Label("Recomendado: 24 chunks verificados."); recommendation.getStyleClass().add("settings-recommendation");
+        Label recommendation = new Label("Recomendado: 15 chunks verificados."); recommendation.getStyleClass().add("settings-recommendation");
         Label explanation = new Label("O Luffy só inicia a reprodução de um torrent incompleto após receber esta quantidade de chunks consecutivos e verificados. Um valor maior reduz travamentos, mas aumenta a espera inicial.");
         explanation.setWrapText(true); explanation.getStyleClass().add("muted");
+        Label warning = new Label("⚠ Atenção: quanto menor a quantidade, mais rápido o vídeo inicia, mas maior é a chance de travar ou voltar para buffering.");
+        warning.setWrapText(true); warning.getStyleClass().add("settings-warning");
         Spinner<Integer> chunks = new Spinner<>(BtTorrentGateway.MIN_STREAM_STARTUP_PIECES,
                 BtTorrentGateway.MAX_STREAM_STARTUP_PIECES, streamingStartupSettings.startupPieces());
         chunks.setEditable(true); chunks.setPrefWidth(150);
@@ -245,7 +247,7 @@ public final class LufiApplication extends Application {
             }
         });
         HBox editor = new HBox(10, new Label("Chunks verificados:"), chunks, save); editor.setAlignment(Pos.CENTER_LEFT);
-        VBox panel = new VBox(12, title, recommendation, explanation, editor, saved);
+        VBox panel = new VBox(12, title, recommendation, explanation, warning, editor, saved);
         panel.getStyleClass().add("content-panel"); panel.setMaxWidth(680);
         VBox box = new VBox(18, heading, panel); box.setPadding(new Insets(24));
         return new Tab("Configurações", box);
@@ -698,6 +700,7 @@ public final class LufiApplication extends Application {
     private void openSession(String raw, WatchMode mode) {
         try {
             var magnet = dev.lufi.domain.MagnetLink.parse(raw.trim());
+            transitionPreviousWatchIfNeeded(magnet.infoHash());
             if (mode == WatchMode.TEMPORARY) swarmAssistManager.recordUserInteraction(magnet.infoHash());
             if (mode == WatchMode.SHARE) removeWatchOnlySwarm(magnet.infoHash());
             watchContext = new WatchContext(raw.trim(), mode);
@@ -715,6 +718,21 @@ public final class LufiApplication extends Application {
             status.setText("Buscando peers no DHT para “" + session.title() + "”. O download sequencial começou.");
             torrents.checkDhtReachability();
         } catch (IllegalArgumentException ex) { status.setText(ex.getMessage()); }
+    }
+
+    /** Trocar de magnet nunca deixa a reprodução e as conexões do anterior disputando o primeiro plano. */
+    private void transitionPreviousWatchIfNeeded(String nextInfoHash) {
+        if (watchContext == null || activeWatchInfoHash == null || activeWatchInfoHash.equalsIgnoreCase(nextInfoHash)) return;
+        String previousInfoHash = activeWatchInfoHash;
+        WatchMode previousMode = watchContext.mode();
+        streamingRequest.incrementAndGet();
+        resetPlayback();
+        watchPlaylist.getItems().clear();
+        BtTorrentGateway.ForegroundWatchTransition transition = torrents.transitionForegroundWatch(previousInfoHash,
+                previousMode, nextInfoHash);
+        diagnostics.log(P2pDiagnostics.Layer.RESULT, "[WATCH] NEW MAGNET: previousInfoHash=" + previousInfoHash
+                + "; nextInfoHash=" + nextInfoHash + "; previousMode=" + previousMode + "; transition="
+                + transition + ".");
     }
     private void onTorrentMetadata(TorrentContent content, String magnet, WatchMode mode) {
         Path folder = content.folder();
@@ -1217,6 +1235,7 @@ public final class LufiApplication extends Application {
         Thread.startVirtualThread(() -> {
             try {
                 int lastVerifiedPieces = -1;
+                boolean waitingForMediaDescription = false;
                 while (streamingRequest.get() == requestId) {
                     BtTorrentGateway.StreamingBufferStatus buffer = torrents.streamingBufferStatus(infoHash);
                     StreamingMediaRouteResolver.Route route = StreamingMediaRouteResolver.resolve(buffer, video.path());
@@ -1230,11 +1249,28 @@ public final class LufiApplication extends Application {
                         return;
                     }
                     if (route == StreamingMediaRouteResolver.Route.LOCAL_HTTP) {
+                        BtTorrentGateway.StreamingMediaWindow mediaWindow = torrents.streamingMediaWindow(infoHash, video.path());
+                        if (mediaWindow.contentLengthBytes() <= 0) {
+                            if (!waitingForMediaDescription) {
+                                waitingForMediaDescription = true;
+                                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM MEDIA DESCRIPTION WAIT: requestId=" + requestId
+                                        + "; infoHash=" + infoHash + "; path=" + video.path()
+                                        + "; reason=file-to-piece-mapping-unavailable.");
+                                Platform.runLater(() -> {
+                                    if (streamingRequest.get() == requestId) {
+                                        status.setText("Preparando a descrição do arquivo para streaming…");
+                                    }
+                                });
+                            }
+                            Thread.sleep(100);
+                            continue;
+                        }
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER READY: requestId=" + requestId + "; infoHash="
                                 + infoHash + "; route=LOCAL_HTTP; downloadedBytes=" + buffer.downloadedBytes() + "; pieces="
                                 + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
                                 + buffer.contiguousPrefixPieces() + "; required=" + buffer.requiredPrefixPieces()
-                                + "; fileBytes=" + Files.size(video.path()) + ".");
+                                + "; fileBytes=" + Files.size(video.path()) + "; mediaLength="
+                                + mediaWindow.contentLengthBytes() + ".");
                         Platform.runLater(() -> {
                             if (streamingRequest.get() == requestId) playTorrentStreaming(video, infoHash);
                         });

@@ -8,10 +8,12 @@ package dev.lufi.infrastructure;
 public enum ConnectionRole {
     STREAM(0),
     DOWNLOAD(1),
-    SEED(2),
-    RENDEZVOUS(3),
-    OVERLAY(4),
-    ASSIST(5);
+    /** Download que o usuário escolheu manter após abrir outro magnet. */
+    BACKGROUND_DOWNLOAD(2),
+    SEED(3),
+    RENDEZVOUS(4),
+    OVERLAY(5),
+    ASSIST(6);
 
     private final int priority;
 
@@ -19,8 +21,8 @@ public enum ConnectionRole {
 
     public int priority() { return priority; }
 
-    /** Stream e download usam o mesmo orçamento de aquisição de conteúdo do usuário. */
-    public boolean isUserTransfer() { return this == STREAM || this == DOWNLOAD; }
+    /** Stream e downloads usam o mesmo orçamento de aquisição de conteúdo do usuário. */
+    public boolean isUserTransfer() { return this == STREAM || this == DOWNLOAD || this == BACKGROUND_DOWNLOAD; }
     /** Rendezvous e overlay compartilham o orçamento de controle persistente. */
     public boolean isOverlayControl() { return this == RENDEZVOUS || this == OVERLAY; }
     public boolean isControlPlane() { return isOverlayControl() || this == ASSIST; }

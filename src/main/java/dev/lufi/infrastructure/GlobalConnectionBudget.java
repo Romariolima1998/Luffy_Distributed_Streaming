@@ -14,6 +14,8 @@ public final class GlobalConnectionBudget {
     public enum AdmissionReason {
         ADMITTED,
         ALREADY_ACCOUNTED,
+        BACKGROUND_LIMIT,
+        PREEMPT_BACKGROUND,
         CATEGORY_LIMIT,
         PENDING_LIMIT,
         RESERVED_FOR_HIGHER_PRIORITY,
@@ -53,7 +55,16 @@ public final class GlobalConnectionBudget {
                 current.categoryLimit(requested), reserveForHigherPriority(requested, current));
 
         int categoryLimit = categoryLimit(snapshot, requested, current);
+        if (requested == ConnectionRole.BACKGROUND_DOWNLOAD
+                && snapshot.count(ConnectionRole.BACKGROUND_DOWNLOAD) >= current.backgroundDownloadConnections()) {
+            return new Decision(false, AdmissionReason.BACKGROUND_LIMIT, requested, snapshot, categoryLimit,
+                    reserveForHigherPriority(requested, current));
+        }
         if (countCategory(snapshot, requested) >= categoryLimit) {
+            if (canPreemptBackgroundDownload(snapshot, requested)) {
+                return new Decision(true, AdmissionReason.PREEMPT_BACKGROUND, requested, snapshot, categoryLimit,
+                        reserveForHigherPriority(requested, current));
+            }
             return new Decision(false, AdmissionReason.CATEGORY_LIMIT, requested, snapshot, categoryLimit,
                     reserveForHigherPriority(requested, current));
         }
@@ -103,7 +114,8 @@ public final class GlobalConnectionBudget {
     }
 
     private int countCategory(Snapshot snapshot, ConnectionRole requested) {
-        if (requested.isUserTransfer()) return snapshot.count(ConnectionRole.STREAM) + snapshot.count(ConnectionRole.DOWNLOAD);
+        if (requested.isUserTransfer()) return snapshot.count(ConnectionRole.STREAM) + snapshot.count(ConnectionRole.DOWNLOAD)
+                + snapshot.count(ConnectionRole.BACKGROUND_DOWNLOAD);
         if (requested.isOverlayControl()) return snapshot.count(ConnectionRole.RENDEZVOUS) + snapshot.count(ConnectionRole.OVERLAY);
         return snapshot.count(requested);
     }
@@ -115,9 +127,16 @@ public final class GlobalConnectionBudget {
         return current.categoryLimit(requested);
     }
 
+    /** Um novo magnet em primeiro plano pode substituir uma conexão em segundo plano. */
+    private boolean canPreemptBackgroundDownload(Snapshot snapshot, ConnectionRole requested) {
+        return (requested == ConnectionRole.STREAM || requested == ConnectionRole.DOWNLOAD)
+                && snapshot.count(ConnectionRole.BACKGROUND_DOWNLOAD) > 0;
+    }
+
     private int reserveForHigherPriority(ConnectionRole requested, ConnectionLimits current) {
         return switch (requested) {
             case STREAM, DOWNLOAD -> 0;
+            case BACKGROUND_DOWNLOAD -> current.streamReserveConnections();
             case SEED, RENDEZVOUS -> current.maxDownloadConnections();
             case OVERLAY -> current.maxDownloadConnections() + current.maxSeedConnections();
             case ASSIST -> current.maxDownloadConnections() + current.maxSeedConnections() + current.maxOverlayConnections();
