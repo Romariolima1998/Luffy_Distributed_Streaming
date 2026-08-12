@@ -6,6 +6,7 @@ import dev.lufi.domain.StreamingSession;
 import dev.lufi.domain.WatchMode;
 import dev.lufi.infrastructure.LocalVideoScanner;
 import dev.lufi.infrastructure.SettingsRepository;
+import dev.lufi.infrastructure.StreamingStartupSettings;
 import dev.lufi.infrastructure.SqliteDatabase;
 import dev.lufi.infrastructure.TorrentMetainfoGenerator;
 import dev.lufi.infrastructure.BtTorrentGateway;
@@ -66,6 +67,7 @@ public final class LufiApplication extends Application {
     private final SwarmAssistSettings swarmAssistSettings = new SwarmAssistSettings(settings);
     private final ConnectionLimitSettings connectionLimitSettings = new ConnectionLimitSettings(settings);
     private final AbuseProtectionSettings abuseProtectionSettings = new AbuseProtectionSettings(settings);
+    private final StreamingStartupSettings streamingStartupSettings = new StreamingStartupSettings(settings);
     private final SwarmMembershipRepository swarmMembershipRepository = new SwarmMembershipRepository(database,
             swarmAssistSettings::maxAssistSwarms, swarmAssistSettings::minAssistResidence,
             swarmAssistSettings::replacementThreshold, swarmAssistSettings::criticalSwarmPeerCount,
@@ -116,6 +118,8 @@ public final class LufiApplication extends Application {
     private final AtomicLong playbackGeneration = new AtomicLong();
     private final AtomicLong lastPlayerPositionLogNanos = new AtomicLong();
     private long streamingMediaPlaybackGeneration = -1L;
+    /** Info-hash cuja prioridade transitória pertence à sessão HTTP atual. */
+    private String streamingPriorityInfoHash;
     /** Controles espelhados entre a janela normal e a tela cheia. */
     private final List<Slider> seekControls = new ArrayList<>();
     private final List<Label> playbackTimeLabels = new ArrayList<>();
@@ -143,7 +147,12 @@ public final class LufiApplication extends Application {
 
     @Override public void start(Stage stage) {
         primaryStage = stage;
-        stage.setOnCloseRequest(event -> shutdownApplication());
+        stage.setOnCloseRequest(event -> {
+            shutdownApplication();
+            // Garante que uma eventual janela secundária (por exemplo, tela
+            // cheia) não mantenha o toolkit JavaFX ativo após a principal fechar.
+            Platform.exit();
+        });
         if (settings.get("cache.max.gb").isEmpty()) showOnboarding(stage); else showMain(stage);
     }
     private void showOnboarding(Stage stage) {
@@ -156,7 +165,7 @@ public final class LufiApplication extends Application {
         stage.setScene(scene(root)); stage.setTitle("Luffy"); stage.show();
     }
     private void showMain(Stage stage) {
-        tabs = new TabPane(watchTab(), libraryTab(), diagnosticsTab(), logsTab()); tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
+        tabs = new TabPane(watchTab(), libraryTab(), settingsTab(), diagnosticsTab(), logsTab()); tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
         tabs.setTabMinWidth(130);
         BorderPane root = new BorderPane(tabs); root.setTop(header()); root.setPadding(new Insets(0, 24, 24, 24));
         var bounds = Screen.getPrimary().getVisualBounds();
@@ -167,6 +176,7 @@ public final class LufiApplication extends Application {
         stage.setTitle("Luffy — streaming P2P"); stage.show();
         torrents.setConnectionLimits(connectionLimitSettings.limits());
         torrents.setAbuseProtectionConfig(abuseProtectionSettings.config());
+        torrents.setStreamingStartupPieces(streamingStartupSettings.startupPieces());
         torrents.setStatusListener(message -> Platform.runLater(() -> status.setText(message)));
         torrents.setTemporaryWatchCompletedListener(magnet -> swarmAssistManager.considerTemporaryWatch(magnet)
                 .exceptionally(error -> {
@@ -210,6 +220,35 @@ public final class LufiApplication extends Application {
         VBox box = new VBox(16, heading, hint, new HBox(10, magnet, open), status, playback); box.setPadding(new Insets(24));
         VBox.setVgrow(playback, Priority.ALWAYS);
         return new Tab("Assistir", box);
+    }
+    private Tab settingsTab() {
+        Label heading = new Label("Configurações"); heading.getStyleClass().add("section-title");
+        Label title = new Label("Buffer inicial para streaming"); title.getStyleClass().add("panel-title");
+        Label recommendation = new Label("Recomendado: 24 chunks verificados."); recommendation.getStyleClass().add("settings-recommendation");
+        Label explanation = new Label("O Luffy só inicia a reprodução de um torrent incompleto após receber esta quantidade de chunks consecutivos e verificados. Um valor maior reduz travamentos, mas aumenta a espera inicial.");
+        explanation.setWrapText(true); explanation.getStyleClass().add("muted");
+        Spinner<Integer> chunks = new Spinner<>(BtTorrentGateway.MIN_STREAM_STARTUP_PIECES,
+                BtTorrentGateway.MAX_STREAM_STARTUP_PIECES, streamingStartupSettings.startupPieces());
+        chunks.setEditable(true); chunks.setPrefWidth(150);
+        Button save = new Button("Salvar");
+        Label saved = new Label(); saved.getStyleClass().add("muted");
+        save.setOnAction(event -> {
+            try {
+                int value = StreamingStartupSettings.normalize(Integer.parseInt(chunks.getEditor().getText().trim()));
+                chunks.getValueFactory().setValue(value);
+                streamingStartupSettings.setStartupPieces(value);
+                torrents.setStreamingStartupPieces(value);
+                saved.setText("Salvo. Novas reproduções vão aguardar " + value + " chunks verificados.");
+            } catch (RuntimeException error) {
+                saved.setText("Informe uma quantidade entre " + BtTorrentGateway.MIN_STREAM_STARTUP_PIECES
+                        + " e " + BtTorrentGateway.MAX_STREAM_STARTUP_PIECES + ".");
+            }
+        });
+        HBox editor = new HBox(10, new Label("Chunks verificados:"), chunks, save); editor.setAlignment(Pos.CENTER_LEFT);
+        VBox panel = new VBox(12, title, recommendation, explanation, editor, saved);
+        panel.getStyleClass().add("content-panel"); panel.setMaxWidth(680);
+        VBox box = new VBox(18, heading, panel); box.setPadding(new Insets(24));
+        return new Tab("Configurações", box);
     }
     private StackPane playerSurface() {
         nowPlaying.getStyleClass().add("muted");
@@ -871,7 +910,12 @@ public final class LufiApplication extends Application {
     private Scene scene(javafx.scene.Parent root) { Scene scene = new Scene(root); scene.getStylesheets().add(getClass().getResource("/lufi.css").toExternalForm()); return scene; }
     private void playLocal(FoundVideo video) {
         long generation = resetPlayback();
-        MediaSource source = new LocalFileMediaSource(video.path());
+        LocalFileMediaSource source = new LocalFileMediaSource(video.path());
+        if (!source.isReadableFile()) {
+            showPlaybackFailure("LOCAL_FILE", new PlayerPlaybackException(PlayerErrorCode.FILE_NOT_FOUND,
+                    "arquivo ausente ou sem permissão de leitura: " + source.path()));
+            return;
+        }
         if (MediaPlayerBackends.requiresMediaBackend(source)) {
             playWithMediaBackend(video, source, generation);
             return;
@@ -905,15 +949,16 @@ public final class LufiApplication extends Application {
                     (buffering, startByte, endByte) -> onStreamingBuffering(generation, buffering, startByte, endByte),
                     (startByte, endByte) -> torrents.streamingRangeProgress(infoHash, video.path(), startByte, endByte)
                             .map(progress -> new LuffyLocalMediaServer.RangeProgress(progress.piecesRequired(), progress.piecesReady()))
-                            .orElse(LuffyLocalMediaServer.RangeProgress.unavailable()));
+                            .orElse(LuffyLocalMediaServer.RangeProgress.unavailable()),
+                    (code, detail) -> onStreamingFailure(generation, code, detail));
             streamingMediaPlaybackGeneration = generation;
+            streamingPriorityInfoHash = infoHash;
             playWithMediaBackend(video, source, generation);
         } catch (RuntimeException error) {
-            localMediaServer.clearRegistrations();
-            streamingMediaPlaybackGeneration = -1L;
+            terminateStreamingSession(generation);
             torrents.setForegroundPlaybackActive(false);
-            playerPlaceholder.setVisible(true);
-            status.setText("Nao foi possivel iniciar o streaming local: " + conciseMediaError(error));
+            showPlaybackFailure("TORRENT_HTTP", new PlayerPlaybackException(PlayerErrorCode.HTTP_STREAM_FAILED,
+                    "não foi possível iniciar o streaming HTTP local: " + PlayerPlaybackException.detail(error), error));
         }
     }
 
@@ -932,9 +977,7 @@ public final class LufiApplication extends Application {
             @Override public void onError(Throwable error) {
                 Platform.runLater(() -> {
                     if (!isCurrentBackendPlayback(generation)) return;
-                    terminateStreamingSession(generation);
-                    torrents.setForegroundPlaybackActive(false); playerPlaceholder.setVisible(true);
-                    status.setText("Não foi possível decodificar o vídeo: " + conciseMediaError(error));
+                    reportPlaybackFailure(generation, playerSource, error);
                 });
             }
 
@@ -987,7 +1030,7 @@ public final class LufiApplication extends Application {
             backendPlayer = null;
         }
         mediaView.setMediaPlayer(null);
-        localMediaServer.clearRegistrations();
+        clearStreamingSessionResources();
         streamingMediaPlaybackGeneration = -1L;
         backendVideoSurface.getChildren().clear();
         backendVideoSurface.setVisible(false);
@@ -1001,10 +1044,20 @@ public final class LufiApplication extends Application {
 
     private void terminateStreamingSession(long generation) {
         if (streamingMediaPlaybackGeneration != generation) return;
-        localMediaServer.clearRegistrations();
+        clearStreamingSessionResources();
         streamingMediaPlaybackGeneration = -1L;
         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD,
                 "LOCAL MEDIA SERVER SESSION ENDED: route=TORRENT_STREAMING; token=revoked.");
+    }
+
+    /** Fecha apenas a ponte de reprodução e devolve o seletor ao download normal. */
+    private void clearStreamingSessionResources() {
+        localMediaServer.clearRegistrations();
+        String infoHash = streamingPriorityInfoHash;
+        streamingPriorityInfoHash = null;
+        if (infoHash != null && !infoHash.isBlank()) {
+            torrents.clearStreamingPriority(infoHash);
+        }
     }
 
     /** A falta temporária de uma piece mantém o player aberto e visível como buffering, não como falha. */
@@ -1016,6 +1069,13 @@ public final class LufiApplication extends Application {
             } else if (backendPlayer.isPlaying()) {
                 status.setText("Reprodução retomada.");
             }
+        });
+    }
+
+    private void onStreamingFailure(long generation, PlayerErrorCode code, String detail) {
+        Platform.runLater(() -> {
+            if (!isCurrentBackendPlayback(generation) || streamingMediaPlaybackGeneration != generation) return;
+            reportPlaybackFailure(generation, "TORRENT_HTTP", new PlayerPlaybackException(code, detail));
         });
     }
 
@@ -1038,6 +1098,7 @@ public final class LufiApplication extends Application {
                 terminateStreamingSession(generation);
                 torrents.setForegroundPlaybackActive(false);
                 updatePlaybackPosition(Duration.ZERO);
+                clearPlayerDisplay();
                 status.setText("Reprodução parada.");
             }
             case FINISHED -> {
@@ -1048,7 +1109,7 @@ public final class LufiApplication extends Application {
             case ERROR -> {
                 terminateStreamingSession(generation);
                 torrents.setForegroundPlaybackActive(false);
-                playerPlaceholder.setVisible(true);
+                clearPlayerDisplay();
             }
             case IDLE -> { }
         }
@@ -1083,6 +1144,8 @@ public final class LufiApplication extends Application {
 
     private void resumePlayback() {
         if (backendPlayer != null) {
+            mediaView.setVisible(false);
+            backendVideoSurface.setVisible(true);
             backendPlayer.play();
             torrents.setForegroundPlaybackActive(true);
         } else if (mediaPlayer != null) {
@@ -1102,6 +1165,17 @@ public final class LufiApplication extends Application {
         terminateStreamingSession(playbackGeneration.get());
         torrents.setForegroundPlaybackActive(false);
         updatePlaybackPosition(Duration.ZERO);
+        clearPlayerDisplay();
+        status.setText("Reprodução parada.");
+    }
+
+    private void clearPlayerDisplay() {
+        playerPlaceholder.setVisible(true);
+        backendVideoSurface.setVisible(false);
+        mediaView.setVisible(false);
+        nowPlaying.setText("Abra um vídeo da sua biblioteca ou um magnet link.");
+        resetSeekControls();
+        refreshTrackControls();
     }
 
     private void setPlaybackVolume(double volume) {
@@ -1118,10 +1192,19 @@ public final class LufiApplication extends Application {
         refreshAudioControls();
     }
 
-    private static String conciseMediaError(Throwable error) {
-        String message = error.getMessage();
-        if (message == null || message.isBlank()) return error.getClass().getSimpleName();
-        return message.length() <= 120 ? message : message.substring(0, 117) + "...";
+    private void reportPlaybackFailure(long generation, String playerSource, Throwable error) {
+        if (!isCurrentBackendPlayback(generation)) return;
+        terminateStreamingSession(generation);
+        torrents.setForegroundPlaybackActive(false);
+        showPlaybackFailure(playerSource, PlayerPlaybackException.from(error, playerSource));
+    }
+
+    private void showPlaybackFailure(String playerSource, PlayerPlaybackException failure) {
+        clearPlayerDisplay();
+        String detail = PlayerPlaybackException.detail(failure).replace(';', ',');
+        diagnostics.log(P2pDiagnostics.Layer.RESULT, "[PLAYER] errorCode=" + failure.code()
+                + "; source=" + playerSource + "; cause=" + detail + ".");
+        status.setText("[" + failure.code() + "] " + failure.code().userMessage());
     }
 
     private void playStreaming(FoundVideo video) {
@@ -1164,7 +1247,10 @@ public final class LufiApplication extends Application {
                                 + buffer.contiguousPrefixPieces() + "; fileExists="
                                 + Files.exists(video.path()) + ".");
                         Platform.runLater(() -> {
-                            if (streamingRequest.get() == requestId) status.setText("A sessão de streaming foi encerrada antes de receber o buffer inicial.");
+                            if (streamingRequest.get() == requestId) {
+                                showPlaybackFailure("TORRENT_HTTP", new PlayerPlaybackException(PlayerErrorCode.TORRENT_STOPPED,
+                                        "a sessão foi encerrada antes de receber o buffer inicial"));
+                            }
                         });
                         return;
                     }
@@ -1187,12 +1273,16 @@ public final class LufiApplication extends Application {
                     }
                     Thread.sleep(1_000);
                 }
-            } catch (Exception error) { Platform.runLater(() -> status.setText("Não foi possível preparar o streaming deste vídeo.")); }
+            } catch (Exception error) {
+                PlayerErrorCode code = Files.isRegularFile(video.path())
+                        ? PlayerErrorCode.HTTP_STREAM_FAILED : PlayerErrorCode.FILE_NOT_FOUND;
+                Platform.runLater(() -> showPlaybackFailure("TORRENT_HTTP", new PlayerPlaybackException(code,
+                        "não foi possível preparar o streaming: " + PlayerPlaybackException.detail(error), error)));
+            }
         });
     }
     @Override public void stop() {
         shutdownApplication();
-        Platform.exit();
     }
 
     /** Fecha os recursos em ordem, de modo idempotente, inclusive quando a janela é fechada pelo sistema. */
@@ -1200,11 +1290,23 @@ public final class LufiApplication extends Application {
         if (!applicationShutdown.compareAndSet(false, true)) return;
         streamingRequest.incrementAndGet();
         hideControls.stop();
-        resetPlayback();
-        localMediaServer.close();
-        swarmAssistManager.close();
-        connectivity.close();
-        torrents.close();
+        shutdownStep("player", this::resetPlayback);
+        shutdownStep("http-local", localMediaServer::close);
+        shutdownStep("swarm-assist", swarmAssistManager::close);
+        shutdownStep("connectivity", connectivity::close);
+        shutdownStep("bittorrent", torrents::close);
+        diagnostics.log(P2pDiagnostics.Layer.RESULT, "[APPLICATION] shutdown=COMPLETED; processExit=launcher.");
+    }
+
+    /** Um recurso que falha ao fechar não pode impedir os demais de encerrar. */
+    private void shutdownStep(String component, Runnable action) {
+        try {
+            action.run();
+            diagnostics.log(P2pDiagnostics.Layer.RESULT, "[APPLICATION] shutdownComponent=" + component + "; result=closed.");
+        } catch (RuntimeException error) {
+            diagnostics.log(P2pDiagnostics.Layer.RESULT, "[APPLICATION] shutdownComponent=" + component
+                    + "; result=failed; detail=" + PlayerPlaybackException.detail(error).replace(';', ',') + ".");
+        }
     }
     private record FoundVideo(String name, Path path) { @Override public String toString() { return name; } }
     private record WatchEntry(String name, String relativePath, Path path) { @Override public String toString() { return name; } }

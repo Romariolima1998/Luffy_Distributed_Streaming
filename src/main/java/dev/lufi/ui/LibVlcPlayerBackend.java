@@ -10,6 +10,7 @@ import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer;
 import uk.co.caprica.vlcj.support.version.Version;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
@@ -84,10 +85,11 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             // de código local para '?'. A representação ASCII preserva cada
             // byte UTF-8 do caminho por percent-encoding para o libVLC.
             if (!created.media().play(sourceUri.toASCIIString())) {
-                throw new IllegalStateException("libVLC recusou abrir a midia informada.");
+                throw new PlayerPlaybackException(PlayerErrorCode.MEDIA_OPEN_FAILED,
+                        "libVLC recusou abrir a mídia informada.");
             }
-        } catch (RuntimeException error) {
-            fail(error);
+        } catch (RuntimeException | LinkageError error) {
+            fail(asOpenFailure(error));
             releaseResources();
         }
     }
@@ -121,7 +123,8 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             // tambem mantem a UI consistente se ele for liberado antes do callback.
             publishStopped();
         } catch (RuntimeException error) {
-            fail(error);
+            fail(new PlayerPlaybackException(PlayerErrorCode.MEDIA_OPEN_FAILED,
+                    "libVLC não conseguiu parar a mídia: " + PlayerPlaybackException.detail(error), error));
         }
     }
 
@@ -215,19 +218,34 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
     public List<MediaTrack> subtitleTracks() {
         EmbeddedMediaPlayer current = mediaPlayer;
         if (current == null) return List.of();
-        return describeTracks(current.subpictures().trackDescriptions(), current.subpictures().track());
+        return describeSubtitleTracks(current.subpictures().trackDescriptions(), current.subpictures().track());
     }
 
     @Override
     public boolean selectAudioTrack(int trackId) {
         EmbeddedMediaPlayer current = mediaPlayer;
-        return current != null && current.audio().setTrack(trackId) == 0;
+        if (current == null) return false;
+        int result = current.audio().setTrack(trackId);
+        int selectedTrack = current.audio().track();
+        boolean applied = selectedTrack == trackId;
+        listener.onDiagnostic("[PLAYER] backend=LIBVLC; event=AUDIO_TRACK_SELECT; requestedId=" + trackId
+                + "; apiResult=" + result + "; selectedId=" + selectedTrack + "; applied=" + applied + ".");
+        return applied;
     }
 
     @Override
     public boolean selectSubtitleTrack(int trackId) {
         EmbeddedMediaPlayer current = mediaPlayer;
-        return current != null && current.subpictures().setTrack(trackId) == 0;
+        if (current == null) return false;
+        // Em algumas compilações estáveis do VLC 3 no Windows, libvlc_video_set_spu
+        // devolve -1 embora a seleção seja aplicada. A fonte de verdade é a faixa
+        // ativa após a chamada, e não o código de retorno isolado.
+        int result = current.subpictures().setTrack(trackId);
+        int selectedTrack = current.subpictures().track();
+        boolean applied = selectedTrack == trackId;
+        listener.onDiagnostic("[PLAYER] backend=LIBVLC; event=SUBTITLE_TRACK_SELECT; requestedId=" + trackId
+                + "; apiResult=" + result + "; selectedId=" + selectedTrack + "; applied=" + applied + ".");
+        return applied;
     }
 
     @Override
@@ -261,7 +279,7 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
         synchronized (lifecycleLock) {
             LibVlcRuntimeDiscovery.Result discovery = LibVlcRuntimeDiscovery.discover(listener::onDiagnostic);
             if (!discovery.available()) {
-                throw new IllegalStateException(discovery.failureMessage());
+                throw new PlayerPlaybackException(PlayerErrorCode.LIBVLC_NOT_FOUND, discovery.failureMessage());
             }
             // A superfície CallbackVideoSurface precisa que o libVLC entregue
             // frames em RV32. Em VLC 3, alguns decoders acelerados (notadamente
@@ -273,7 +291,8 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             Version nativeVersion = new Version(factory.application().version());
             if (nativeVersion.major() != REQUIRED_LIBVLC_MAJOR_VERSION) {
                 factory.release();
-                throw new IllegalStateException("O backend libVLC requer VLC 3.x estavel; encontrado " + nativeVersion + ".");
+                throw new PlayerPlaybackException(PlayerErrorCode.LIBVLC_NOT_FOUND,
+                        "O backend libVLC requer VLC 3.x estável; encontrado " + nativeVersion + ".");
             }
             mediaPlayerFactory = factory;
             listener.onDiagnostic("[PLAYER] backend=LIBVLC; event=RUNTIME_READY; vlcj=4.12.1; libvlc=" + nativeVersion
@@ -288,9 +307,26 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
         if (descriptions == null || descriptions.isEmpty()) return List.of();
         return descriptions.stream()
                 .filter(Objects::nonNull)
-                .map(description -> new MediaTrack(description.id(), description.description(),
+                .map(description -> new MediaTrack(description.id(), readableTrackLabel(description.description()),
                         description.id() == selectedTrackId))
                 .toList();
+    }
+
+    private static List<MediaTrack> describeSubtitleTracks(List<TrackDescription> descriptions, int selectedTrackId) {
+        if (descriptions == null || descriptions.isEmpty()) return List.of();
+        return descriptions.stream()
+                .filter(Objects::nonNull)
+                .map(description -> new MediaTrack(description.id(), description.id() < 0
+                        ? "Desativar legendas"
+                        : readableTrackLabel(description.description()), description.id() == selectedTrackId))
+                .toList();
+    }
+
+    /** Corrige somente textos UTF-8 que o runtime nativo entregou como Latin-1. */
+    private static String readableTrackLabel(String label) {
+        if (label == null || !label.contains("Ã")) return label;
+        String repaired = new String(label.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
+        return repaired.contains("�") ? label : repaired;
     }
 
     private void configureEvents(EmbeddedMediaPlayer configuredPlayer) {
@@ -321,7 +357,8 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             @Override
             public void error(MediaPlayer mediaPlayer) {
                 if (isCurrentPlayer(mediaPlayer)) {
-                    fail(new IllegalStateException("libVLC reportou um erro durante a reproducao."));
+                    fail(new PlayerPlaybackException(PlayerErrorCode.MEDIA_DECODE_FAILED,
+                            "libVLC reportou um erro durante a reprodução."));
                 }
             }
 
@@ -402,6 +439,16 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
 
     private void fail(Throwable error) {
         if (transition(State.ERROR)) listener.onError(error);
+    }
+
+    private static PlayerPlaybackException asOpenFailure(Throwable error) {
+        if (error instanceof PlayerPlaybackException known) return known;
+        if (error instanceof LinkageError) {
+            return new PlayerPlaybackException(PlayerErrorCode.LIBVLC_NOT_FOUND,
+                    "Não foi possível carregar a biblioteca nativa do libVLC: " + PlayerPlaybackException.detail(error), error);
+        }
+        return new PlayerPlaybackException(PlayerErrorCode.MEDIA_OPEN_FAILED,
+                "libVLC não conseguiu abrir a mídia: " + PlayerPlaybackException.detail(error), error);
     }
 
     private boolean transition(State nextState) {

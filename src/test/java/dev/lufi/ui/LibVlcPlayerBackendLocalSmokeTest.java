@@ -11,10 +11,12 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -150,6 +152,15 @@ class LibVlcPlayerBackendLocalSmokeTest {
             assertNoPlayerError(playerError);
             assertTrue(awaitPresentedFrame(backendReference.get(), viewReference.get(), playerError),
                     failureMessage("libVLC nao apresentou imagem a partir do HTTP local", playerError));
+            List<MediaTrack> subtitleTracks = awaitSubtitleTracks(backendReference.get(), playerError);
+            assertTrue(subtitleTracks.size() > 1,
+                    "A reprodução HTTP não expôs as faixas de legenda do MKV: " + subtitleTracks);
+            MediaTrack alternativeSubtitle = subtitleTracks.stream()
+                    .filter(track -> track.id() >= 0 && !track.selected())
+                    .findFirst()
+                    .orElseThrow(() -> new AssertionError("Não há uma faixa de legenda alternativa para testar."));
+            assertTrue(backendReference.get().selectSubtitleTrack(alternativeSubtitle.id()),
+                    "O streaming HTTP não aplicou a faixa de legenda " + alternativeSubtitle.id());
         } finally {
             LibVlcPlayerBackend backend = backendReference.get();
             if (backend != null) onFxThread(backend::release);
@@ -157,6 +168,79 @@ class LibVlcPlayerBackendLocalSmokeTest {
             if (stage != null) onFxThread(stage::close);
             server.close();
         }
+    }
+
+    @Test
+    void reportsAndSelectsEmbeddedSubtitleTracksForTheSuppliedLocalMedia() throws Exception {
+        Path source = Path.of(System.getenv("LUFFY_LOCAL_VIDEO_SMOKE"));
+        assertTrue(Files.isRegularFile(source) && Files.isReadable(source), "Arquivo local não pode ser lido: " + source);
+
+        AtomicReference<LibVlcPlayerBackend> backendReference = new AtomicReference<>();
+        AtomicReference<Stage> stageReference = new AtomicReference<>();
+        AtomicReference<Throwable> playerError = new AtomicReference<>();
+        CountDownLatch playing = new CountDownLatch(1);
+        try {
+            onFxThread(() -> {
+                LibVlcPlayerBackend backend = new LibVlcPlayerBackend();
+                backendReference.set(backend);
+                Stage stage = new Stage();
+                stage.setScene(new Scene(new StackPane(backend.createVideoView()), 640, 360));
+                stageReference.set(stage);
+                stage.show();
+                backend.setMute(true);
+                backend.setListener(new MediaPlayerBackend.Listener() {
+                    @Override public void onStateChanged(MediaPlayerBackend.State state) {
+                        if (state == MediaPlayerBackend.State.PLAYING) playing.countDown();
+                    }
+
+                    @Override public void onError(Throwable error) {
+                        playerError.compareAndSet(null, error);
+                        playing.countDown();
+                    }
+                });
+                backend.open(new LocalFileMediaSource(source).uri());
+            });
+
+            assertTrue(playing.await(TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                    failureMessage("libVLC não iniciou a mídia para testar as legendas", playerError));
+            assertNoPlayerError(playerError);
+            List<MediaTrack> tracks = awaitSubtitleTracks(backendReference.get(), playerError);
+            System.out.println("LUFFY_SUBTITLE_TRACKS=" + tracks.stream()
+                    .map(track -> track.id() + ":" + track.label() + ":selected=" + track.selected())
+                    .collect(Collectors.joining(" | ")));
+            assertTrue(tracks.size() > 1,
+                    "A mídia não expôs mais de uma faixa de legenda: " + tracks);
+
+            for (MediaTrack track : tracks.stream().filter(track -> track.id() >= 0).toList()) {
+                boolean selected = backendReference.get().selectSubtitleTrack(track.id());
+                Thread.sleep(300L);
+                int selectedAfterRequest = backendReference.get().subtitleTracks().stream()
+                        .filter(MediaTrack::selected)
+                        .mapToInt(MediaTrack::id)
+                        .findFirst()
+                        .orElse(Integer.MIN_VALUE);
+                System.out.println("LUFFY_SUBTITLE_SELECT=id=" + track.id() + "; success=" + selected);
+                System.out.println("LUFFY_SUBTITLE_SELECTED_AFTER=id=" + selectedAfterRequest);
+                assertTrue(selected || selectedAfterRequest == track.id(),
+                        "libVLC recusou a faixa de legenda id=" + track.id() + "; label=" + track.label());
+            }
+        } finally {
+            LibVlcPlayerBackend backend = backendReference.get();
+            if (backend != null) onFxThread(backend::release);
+            Stage stage = stageReference.get();
+            if (stage != null) onFxThread(stage::close);
+        }
+    }
+
+    private static List<MediaTrack> awaitSubtitleTracks(LibVlcPlayerBackend backend,
+                                                         AtomicReference<Throwable> playerError) throws Exception {
+        List<MediaTrack> tracks = List.of();
+        for (int attempt = 0; attempt < TIMEOUT_SECONDS * 10; attempt++) {
+            tracks = backend.subtitleTracks();
+            if (tracks.size() > 1 || playerError.get() != null) return tracks;
+            Thread.sleep(100L);
+        }
+        return tracks;
     }
 
     private static boolean awaitPresentedFrame(LibVlcPlayerBackend backend, LuffyVideoView view,

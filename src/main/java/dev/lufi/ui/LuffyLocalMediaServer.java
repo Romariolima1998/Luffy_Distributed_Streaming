@@ -23,6 +23,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
@@ -90,17 +91,28 @@ final class LuffyLocalMediaServer implements AutoCloseable {
                                                        RangeAvailability rangeAvailability,
                                                        BufferingListener bufferingListener,
                                                        RangeMetrics rangeMetrics) {
+        return register(file, availability, rangeListener, rangeAvailability, bufferingListener, rangeMetrics,
+                (code, detail) -> { });
+    }
+
+    synchronized TorrentStreamingMediaSource register(Path file, Supplier<VerifiedMediaWindow> availability,
+                                                       RangeListener rangeListener,
+                                                       RangeAvailability rangeAvailability,
+                                                       BufferingListener bufferingListener,
+                                                       RangeMetrics rangeMetrics,
+                                                       FailureListener failureListener) {
         Objects.requireNonNull(file, "file");
         Objects.requireNonNull(availability, "availability");
         Objects.requireNonNull(rangeListener, "rangeListener");
         Objects.requireNonNull(rangeAvailability, "rangeAvailability");
         Objects.requireNonNull(bufferingListener, "bufferingListener");
         Objects.requireNonNull(rangeMetrics, "rangeMetrics");
+        Objects.requireNonNull(failureListener, "failureListener");
         startIfNeeded();
         String sessionId = newOpaqueId();
         String fileId = newOpaqueId();
         registrations.put(sessionId + "/" + fileId, new Registration(file.toAbsolutePath().normalize(), availability, rangeListener,
-                rangeAvailability, bufferingListener, rangeMetrics, new BufferingTracker()));
+                rangeAvailability, bufferingListener, rangeMetrics, failureListener, new BufferingTracker()));
         URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + MEDIA_PREFIX + sessionId + "/" + fileId);
         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "LOCAL MEDIA SERVER REGISTERED: route=TORRENT_STREAMING; "
                 + "address=127.0.0.1:" + server.getAddress().getPort() + "; session=redacted; fileId=redacted; file="
@@ -109,6 +121,7 @@ final class LuffyLocalMediaServer implements AutoCloseable {
     }
 
     synchronized void clearRegistrations() {
+        registrations.values().forEach(Registration::invalidate);
         registrations.clear();
     }
 
@@ -139,13 +152,26 @@ final class LuffyLocalMediaServer implements AutoCloseable {
                 return;
             }
             Registration registration = registrationFor(exchange.getRequestURI());
-            if (registration == null || !Files.isRegularFile(registration.file())) {
+            if (registration == null) {
+                exchange.sendResponseHeaders(404, -1);
+                return;
+            }
+            if (!registration.active()) {
+                signalFailure(registration, PlayerErrorCode.TORRENT_STOPPED, "token de streaming invalidado");
+                exchange.sendResponseHeaders(503, -1);
+                return;
+            }
+            if (!Files.isRegularFile(registration.file())) {
+                signalFailure(registration, PlayerErrorCode.FILE_NOT_FOUND,
+                        "arquivo ausente: " + registration.file());
                 exchange.sendResponseHeaders(404, -1);
                 return;
             }
             VerifiedMediaWindow initial = registration.availability().get();
             long contentLength = initial.contentLengthBytes();
             if (contentLength <= 0) {
+                signalFailure(registration, PlayerErrorCode.HTTP_STREAM_FAILED,
+                        "o arquivo ainda não informou um tamanho utilizável");
                 exchange.getResponseHeaders().set("Retry-After", "1");
                 exchange.sendResponseHeaders(503, -1);
                 return;
@@ -177,6 +203,9 @@ final class LuffyLocalMediaServer implements AutoCloseable {
                 AvailableRange available = awaitAvailableRange(registration, range);
                 if (available == null) {
                     logRangeTelemetry(registration, range, range, elapsedMillis(waitStartedNanos));
+                    PlayerErrorCode code = registration.active() && registration.availability().get().sessionActive()
+                            ? PlayerErrorCode.HTTP_STREAM_FAILED : PlayerErrorCode.TORRENT_STOPPED;
+                    signalFailure(registration, code, "a requisição HTTP foi encerrada antes de a faixa ficar disponível");
                     headers.set("Retry-After", "1");
                     exchange.sendResponseHeaders(503, -1);
                     return;
@@ -217,6 +246,7 @@ final class LuffyLocalMediaServer implements AutoCloseable {
         boolean buffering = false;
         try {
             while (true) {
+                if (!registration.active()) return false;
                 VerifiedMediaWindow window = registration.availability().get();
                 if (window.verifiedPrefixBytes() >= requiredExclusive) return true;
                 if (!buffering) {
@@ -245,6 +275,7 @@ final class LuffyLocalMediaServer implements AutoCloseable {
         boolean buffering = false;
         try {
             while (true) {
+                if (!registration.active()) return null;
                 VerifiedMediaWindow window = registration.availability().get();
                 if (window.hasVerifiedRange(requested.start(), requested.start())) {
                     long safeEnd = Math.min(requested.end(), window.verifiedPrefixBytes() - 1);
@@ -282,6 +313,13 @@ final class LuffyLocalMediaServer implements AutoCloseable {
         registration.bufferingListener().onBuffering(buffering, startByte, endByte);
         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM HTTP BUFFERING " + (buffering ? "START" : "END")
                 + ": range=" + startByte + "-" + endByte + "; waitPolicy=session-active.");
+    }
+
+    private void signalFailure(Registration registration, PlayerErrorCode code, String detail) {
+        if (!registration.signalFailure()) return;
+        registration.failureListener().onFailure(code, detail);
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[STREAM-HTTP] errorCode=" + code
+                + "; detail=" + detail.replace(';', ',') + ".");
     }
 
     private void logRangeTelemetry(Registration registration, Range requested, Range served, long waitMs) {
@@ -373,7 +411,7 @@ final class LuffyLocalMediaServer implements AutoCloseable {
 
     @Override
     public synchronized void close() {
-        registrations.clear();
+        clearRegistrations();
         if (server != null) {
             server.stop(0);
             server = null;
@@ -412,9 +450,49 @@ final class LuffyLocalMediaServer implements AutoCloseable {
         RangeProgress progress(long startByte, long endByte);
     }
 
-    private record Registration(Path file, Supplier<VerifiedMediaWindow> availability, RangeListener rangeListener,
-                                RangeAvailability rangeAvailability, BufferingListener bufferingListener, RangeMetrics rangeMetrics,
-                                BufferingTracker bufferingTracker) { }
+    @FunctionalInterface
+    interface FailureListener {
+        void onFailure(PlayerErrorCode code, String detail);
+    }
+
+    private static final class Registration {
+        private final Path file;
+        private final Supplier<VerifiedMediaWindow> availability;
+        private final RangeListener rangeListener;
+        private final RangeAvailability rangeAvailability;
+        private final BufferingListener bufferingListener;
+        private final RangeMetrics rangeMetrics;
+        private final FailureListener failureListener;
+        private final BufferingTracker bufferingTracker;
+        private final AtomicBoolean active = new AtomicBoolean(true);
+        private final AtomicBoolean failureSignalled = new AtomicBoolean();
+
+        private Registration(Path file, Supplier<VerifiedMediaWindow> availability, RangeListener rangeListener,
+                             RangeAvailability rangeAvailability, BufferingListener bufferingListener,
+                             RangeMetrics rangeMetrics, FailureListener failureListener,
+                             BufferingTracker bufferingTracker) {
+            this.file = file;
+            this.availability = availability;
+            this.rangeListener = rangeListener;
+            this.rangeAvailability = rangeAvailability;
+            this.bufferingListener = bufferingListener;
+            this.rangeMetrics = rangeMetrics;
+            this.failureListener = failureListener;
+            this.bufferingTracker = bufferingTracker;
+        }
+
+        Path file() { return file; }
+        Supplier<VerifiedMediaWindow> availability() { return availability; }
+        RangeListener rangeListener() { return rangeListener; }
+        RangeAvailability rangeAvailability() { return rangeAvailability; }
+        BufferingListener bufferingListener() { return bufferingListener; }
+        RangeMetrics rangeMetrics() { return rangeMetrics; }
+        FailureListener failureListener() { return failureListener; }
+        BufferingTracker bufferingTracker() { return bufferingTracker; }
+        boolean active() { return active.get(); }
+        void invalidate() { active.set(false); }
+        boolean signalFailure() { return failureSignalled.compareAndSet(false, true); }
+    }
 
     private record AvailableRange(Range range) { }
 

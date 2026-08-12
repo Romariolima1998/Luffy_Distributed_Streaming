@@ -77,7 +77,9 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     private static final Duration SWARM_ASSIST_REPLENISH_DELAY = Duration.ofSeconds(5);
     private static final Duration SWARM_ASSIST_PEX_FRESHNESS = Duration.ofMinutes(2);
     /** Margem inicial contínua antes de abrir um arquivo temporário no player. */
-    private static final int STREAM_STARTUP_PIECES = 24;
+    public static final int DEFAULT_STREAM_STARTUP_PIECES = 24;
+    public static final int MIN_STREAM_STARTUP_PIECES = 1;
+    public static final int MAX_STREAM_STARTUP_PIECES = 500;
     private final Path cacheDirectory;
     private final P2pDiagnostics diagnostics;
     private final Map<String, BtClient> sessions = new ConcurrentHashMap<>();
@@ -116,6 +118,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     /** Janela ativa por torrent; uma nova janela substitui a prioridade anterior. */
     private final Map<String, StreamingPriorityWindow> streamingPriorityWindows = new ConcurrentHashMap<>();
     private volatile StreamingReadAheadPolicy streamingReadAheadPolicy = StreamingReadAheadPolicy.defaults();
+    /** Preferência da UI, aplicada somente ao ponto de início do streaming. */
+    private volatile int streamStartupPieces = DEFAULT_STREAM_STARTUP_PIECES;
     /** Peças iniciais confirmadas por torrent; necessárias antes de entregar um arquivo pré-alocado ao player. */
     private final StreamingPiecePrefixTracker streamingPiecePrefixes = new StreamingPiecePrefixTracker();
     private final PeerConnectivityManager peerConnectivity;
@@ -284,13 +288,20 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                 + "; total=" + current.maxTotalConnections() + ".");
     }
     public ConnectionLimits connectionLimits() { return globalConnectionBudget.limits(); }
+    /** Atualiza quantas pieces iniciais, verificadas e contínuas, o player espera antes de abrir o HTTP local. */
+    public void setStreamingStartupPieces(int pieces) {
+        streamStartupPieces = Math.max(MIN_STREAM_STARTUP_PIECES, Math.min(MAX_STREAM_STARTUP_PIECES, pieces));
+        diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM STARTUP BUFFER: requiredPieces=" + streamStartupPieces + ".");
+    }
+    public int streamingStartupPieces() { return streamStartupPieces; }
     /** Estado real do buffer, atualizado pelo callback do bt-core a cada segundo. */
     public StreamingBufferStatus streamingBufferStatus(String infoHash) {
         if (infoHash == null || infoHash.isBlank()) return StreamingBufferStatus.unavailable();
         TransferSnapshot snapshot = transferSnapshots.get(infoHash.toLowerCase());
         boolean active = isTorrentSessionActive(infoHash);
-        if (snapshot == null) return new StreamingBufferStatus(0, 0, 0, 0, STREAM_STARTUP_PIECES, active);
-        int required = snapshot.piecesTotal() > 0 ? Math.min(STREAM_STARTUP_PIECES, snapshot.piecesTotal()) : STREAM_STARTUP_PIECES;
+        int configuredStartupPieces = streamStartupPieces;
+        if (snapshot == null) return new StreamingBufferStatus(0, 0, 0, 0, configuredStartupPieces, active);
+        int required = snapshot.piecesTotal() > 0 ? Math.min(configuredStartupPieces, snapshot.piecesTotal()) : configuredStartupPieces;
         int contiguousPrefix = streamingPiecePrefixes.contiguousPrefix(infoHash, snapshot.piecesTotal());
         return new StreamingBufferStatus(snapshot.downloaded(), snapshot.piecesComplete(), contiguousPrefix,
                 snapshot.piecesTotal(), required, active);
@@ -375,6 +386,27 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
                     + "; previousPieces=" + previous.priorityStartPiece() + "-" + previous.priorityEndPiece()
                     + "; currentPieces=" + current.priorityStartPiece() + "-" + current.priorityEndPiece()
                     + "; oldPriority=cleared.");
+        }
+    }
+
+    /**
+     * Remove somente a prioridade temporária de leitura do player.
+     *
+     * <p>O torrent, seus peers, verificações e download normal permanecem
+     * ativos. Sem essa chamada, uma janela antiga de reprodução poderia
+     * continuar recebendo precedência mesmo depois de o usuário parar o vídeo.</p>
+     */
+    public void clearStreamingPriority(String infoHash) {
+        if (infoHash == null || infoHash.isBlank()) return;
+        String normalized = normalizeInfoHash(infoHash);
+        StreamingPriorityWindow previous = streamingPriorityWindows.remove(normalized);
+        PrioritizedPieceSelector selector = streamingPieceSelectors.get(normalized);
+        if (selector != null) {
+            selector.setHighPriorityPieces(new java.util.BitSet());
+        }
+        if (previous != null) {
+            diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[STREAM-PRIORITY] action=CLEARED; infoHash=" + infoHash
+                    + "; previousPieces=" + previous.priorityStartPiece() + "-" + previous.priorityEndPiece() + ".");
         }
     }
 
@@ -726,7 +758,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         if (localSource != null) onMetadata.accept(new TorrentContent(localSource, listFiles(localSource)));
         else restartDownload(magnet, mode, selectedRelativePath, onMetadata);
         return new StreamingSession(magnet.infoHash(), magnet.displayName().orElse("Vídeo sem título"), mode,
-                StreamingSession.SessionStatus.BUFFERING, 0, 12, Instant.now());
+                StreamingSession.SessionStatus.BUFFERING, 0, streamStartupPieces, Instant.now());
     }
 
     /** A second "Abrir magnet" is an explicit retry, not a no-op against a stalled lookup. */
@@ -2122,7 +2154,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
             return Math.min(Math.max(1, requiredPieces), Math.max(1, totalPieces));
         }
         static StreamingBufferStatus unavailable() {
-            return new StreamingBufferStatus(0, 0, 0, 0, STREAM_STARTUP_PIECES, false);
+            return new StreamingBufferStatus(0, 0, 0, 0, DEFAULT_STREAM_STARTUP_PIECES, false);
         }
     }
     /** Byte window that the localhost server may read without exposing unverified gaps. */

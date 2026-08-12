@@ -24,6 +24,30 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LuffyLocalMediaServerTest {
+
+    @Test
+    void reportsMissingRegisteredFileWithAStableErrorCode() throws Exception {
+        Path file = Files.createTempFile("luffy-stream-missing", ".mkv");
+        Files.writeString(file, "temporary media");
+        AtomicReference<PlayerErrorCode> errorCode = new AtomicReference<>();
+        LuffyLocalMediaServer server = new LuffyLocalMediaServer(new P2pDiagnostics());
+        try {
+            TorrentStreamingMediaSource source = server.register(file,
+                    () -> new LuffyLocalMediaServer.VerifiedMediaWindow(15, 15, true),
+                    (start, end) -> { }, (start, end) -> true, (buffering, start, end) -> { },
+                    (start, end) -> LuffyLocalMediaServer.RangeProgress.unavailable(),
+                    (code, detail) -> errorCode.set(code));
+            Files.delete(file);
+
+            HttpResponse<Void> response = HttpClient.newHttpClient().send(HttpRequest.newBuilder(source.uri())
+                    .GET().build(), HttpResponse.BodyHandlers.discarding());
+            assertEquals(404, response.statusCode());
+            assertEquals(PlayerErrorCode.FILE_NOT_FOUND, errorCode.get());
+        } finally {
+            server.close();
+            Files.deleteIfExists(file);
+        }
+    }
     @Test
     void exposesOnlyTheVerifiedPrefixAndSupportsRanges() throws Exception {
         Path file = Files.createTempFile("luffy-local-media-", ".mp4");
