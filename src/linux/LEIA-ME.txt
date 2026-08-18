@@ -15,3 +15,13 @@ Tambem e possivel iniciar diretamente:
 Nao execute o arquivo .jar usando ./Luffy-0.1.0-linux.jar: ele nao e um binario Linux.
 
 Esta versao contem as bibliotecas nativas JavaFX para Linux x86_64.
+Integração com magnet e .torrent
+--------------------------------
+
+Após extrair a pasta, execute uma vez:
+
+  sh install-desktop-integration.sh
+
+Isso registra o Luffy como uma opção para links magnet: e arquivos .torrent
+somente para o usuário atual. O script não altera o aplicativo padrão; escolha
+Luffy em “Abrir com” ou nas configurações do navegador/ambiente gráfico.

@@ -12,11 +12,20 @@ public final class LuffyLauncher {
      */
     public static void main(String[] args) {
         int exitCode = 0;
+        LuffySingleInstance.Acquisition acquisition = null;
         try {
+            acquisition = LuffySingleInstance.acquireOrForward(args);
+            if (!acquisition.isPrimary()) return;
+            LufiApplication.setSingleInstanceCoordinator(acquisition.primary());
             LufiApplication.main(args);
         } catch (Throwable error) {
             error.printStackTrace(System.err);
             exitCode = 1;
+        } finally {
+            // A segunda chamada só encaminha o pedido e sai. A principal libera
+            // a porta local depois do ciclo JavaFX completo.
+            if (acquisition != null && acquisition.isPrimary()) acquisition.primary().close();
+            LufiApplication.clearSingleInstanceCoordinator();
         }
         System.exit(exitCode);
     }

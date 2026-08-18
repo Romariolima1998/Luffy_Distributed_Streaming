@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Luffy
+Comment=Streaming e downloads BitTorrent no Luffy
+Exec=@LUFFY_EXECUTABLE@ %U
+Terminal=false
+Categories=AudioVideo;Network;FileTransfer;
+MimeType=x-scheme-handler/magnet;application/x-bittorrent;application/x-torrent;
+StartupNotify=true

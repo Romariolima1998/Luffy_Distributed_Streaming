@@ -15,6 +15,8 @@ import bt.peerexchange.PeerExchangeModule;
 import bt.torrent.selector.PrioritizedPieceSelector;
 import dev.lufi.application.port.TorrentGateway;
 import dev.lufi.application.port.TorrentContent;
+import dev.lufi.application.port.TorrentMetadata;
+import dev.lufi.application.port.TorrentOpenRequest;
 import dev.lufi.domain.MagnetLink;
 import dev.lufi.domain.StreamingSession;
 import dev.lufi.domain.WatchMode;
@@ -88,6 +90,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     private final Path cacheDirectory;
     private final P2pDiagnostics diagnostics;
     private final Map<String, BtClient> sessions = new ConcurrentHashMap<>();
+    /** Original .torrent files whose embedded metadata must be passed straight to bt-core. */
+    private final Map<String, Path> embeddedTorrentFiles = new ConcurrentHashMap<>();
     /** Permite aguardar o encerramento efetivo de um cliente antes de reutilizar o mesmo torrent na runtime. */
     private final Map<BtClient, CompletableFuture<?>> clientProcessCompletions = new ConcurrentHashMap<>();
     /** Prévia isolada: impede que prioridades SKIP contaminem a sessão principal do torrent. */
@@ -533,9 +537,16 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         streamingPieceSelectors.remove(infoHash);
         streamingPriorityWindows.remove(infoHash);
         selectedFileSessions.remove(infoHash);
+        embeddedTorrentFiles.remove(infoHash);
         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "[WATCH] SESSION SWITCH: previousInfoHash=" + infoHash
                 + "; nextInfoHash=" + nextInfoHash + "; action=STOP_TEMPORARY; clientStopped=" + (client != null) + ".");
         return ForegroundWatchTransition.TEMPORARY_STOPPED;
+    }
+
+    /** Cancela a prévia de metadata criada pelo diálogo "Adicionar torrent". */
+    @Override public void cancelOpen(String infoHash) {
+        if (infoHash == null || infoHash.isBlank()) return;
+        transitionForegroundWatch(infoHash, WatchMode.TEMPORARY, "cancelled-open");
     }
     public void setConnectivityProfile(ConnectivityProfile profile) {
         connectivity = profile == null ? ConnectivityProfile.unavailable() : profile;
@@ -825,12 +836,26 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
     }
 
     @Override public StreamingSession open(MagnetLink magnet, WatchMode mode) {
-        return open(magnet, mode, ignored -> { });
+        return open(TorrentOpenRequest.magnet(magnet), mode, ignored -> { });
     }
     @Override public StreamingSession open(MagnetLink magnet, WatchMode mode, Consumer<TorrentContent> onMetadata) {
-        return open(magnet, mode, null, onMetadata);
+        return open(TorrentOpenRequest.magnet(magnet), mode, null, onMetadata);
     }
     @Override public StreamingSession open(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
+        return open(TorrentOpenRequest.magnet(magnet), mode, selectedRelativePath, onMetadata);
+    }
+    @Override public StreamingSession open(TorrentOpenRequest request, WatchMode mode) {
+        return open(request, mode, ignored -> { });
+    }
+    @Override public StreamingSession open(TorrentOpenRequest request, WatchMode mode, Consumer<TorrentContent> onMetadata) {
+        return open(request, mode, null, onMetadata);
+    }
+    @Override public StreamingSession open(TorrentOpenRequest request, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
+        Objects.requireNonNull(request, "request");
+        MagnetLink magnet = request.magnet();
+        String infoHash = normalizeInfoHash(magnet.infoHash());
+        request.torrentFile().ifPresentOrElse(file -> embeddedTorrentFiles.put(infoHash, file),
+                () -> embeddedTorrentFiles.remove(infoHash));
         Path localSource = publishedRoots.get(magnet.infoHash());
         if (localSource != null) onMetadata.accept(new TorrentContent(localSource, listFiles(localSource)));
         else restartDownload(magnet, mode, selectedRelativePath, onMetadata);
@@ -983,8 +1008,15 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         // Assistir usa uma prévia somente de metadados. “Apenas baixar” começa a
         // transferência de todos os arquivos logo que os metadados chegam.
         boolean metadataOnly = selectedRelativePath == null && mode != WatchMode.DOWNLOAD;
+        Path embeddedTorrentFile = embeddedTorrentFiles.get(normalizeInfoHash(magnet.infoHash()));
+        boolean usesEmbeddedMetadata = embeddedTorrentFile != null;
         Path target = metadataOnly ? temporaryDirectory()
                 : mode.isPersistentDownload() ? sharedTorrentDirectory(magnet) : temporaryDirectory();
+        // A prévia deve ser isolada inclusive quando a metadata vem de um
+        // arquivo .torrent. O bt-core guarda as prioridades SKIP por TorrentId
+        // dentro da runtime; usar a runtime principal aqui fazia a sessão criada
+        // ao clicar no vídeo herdar SKIP e manter peers conectados sem requisitar
+        // nenhuma peça.
         BtRuntime activeRuntime = metadataOnly ? metadataPreviewRuntime(magnet.infoHash()) : runtime();
         attachTorrentDiagnostics(activeRuntime, magnet.infoHash(), "DOWNLOAD");
         AtomicInteger selectorCalls = new AtomicInteger();
@@ -1008,12 +1040,24 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         PrioritizedPieceSelector streamingSelector = selectedFileSelector == null ? null
                 : new PrioritizedPieceSelector(selectedFileSelector);
         if (streamingSelector != null) streamingPieceSelectors.put(normalizeInfoHash(magnet.infoHash()), streamingSelector);
-        var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target)).magnet(toUri(magnet));
+        var builder = Bt.client(activeRuntime).storage(new FileSystemStorage(target));
+        if (usesEmbeddedMetadata) {
+            try {
+                builder.torrent(embeddedTorrentFile.toUri().toURL());
+                diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "TORRENT FILE OPEN: infoHash=" + magnet.infoHash()
+                        + "; source=" + embeddedTorrentFile + "; metadata=EMBEDDED.");
+            } catch (MalformedURLException error) {
+                throw new IllegalArgumentException("Arquivo .torrent inválido", error);
+            }
+        } else {
+            builder.magnet(toUri(magnet));
+        }
         if (streamingSelector == null) builder.sequentialSelector();
         else builder.selector(streamingSelector);
         builder.afterTorrentFetched(torrent -> {
-                    TorrentContent content = StreamingTorrentContentLayout.resolve(target, torrent.getName(),
+                    TorrentContent layout = StreamingTorrentContentLayout.resolve(target, torrent.getName(),
                             torrent.getFiles().stream().map(file -> file.getPathElements()).toList());
+                    TorrentContent content = new TorrentContent(layout.folder(), layout.files(), torrentMetadata(torrent));
                     if (selectedRelativePath != null) {
                         boolean found = torrent.getFiles().stream().anyMatch(file -> StreamingFileSelection.matches(selectedRelativePath, file.getPathElements()));
                         String torrentPaths = torrent.getFiles().stream().limit(8)
@@ -1083,8 +1127,8 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         BtClient client = builder.build();
         clientReference.set(client);
         startClient(metadataOnly ? "Metadata" : "Download", magnet.displayName().orElse("vídeo"), magnet.infoHash(), client, () -> { });
-        if (metadataOnly) connectKnownTcpPeersToMetadataPreview(magnet.infoHash(), activeRuntime);
-        reportMissingMetadataAfterDelay(magnet, client);
+        if (metadataOnly && !usesEmbeddedMetadata) connectKnownTcpPeersToMetadataPreview(magnet.infoHash(), activeRuntime);
+        if (!usesEmbeddedMetadata) reportMissingMetadataAfterDelay(magnet, client);
         return client;
     }
 
@@ -1107,6 +1151,14 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         }
         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM MEDIA FILES REGISTERED: infoHash=" + infoHash
                 + "; files=" + registered + "/" + files.size() + "; root=" + content.folder() + ".");
+    }
+
+    private static TorrentMetadata torrentMetadata(bt.metainfo.Torrent torrent) {
+        List<String> trackers = torrent.getAnnounceKey().map(key -> key.isMultiKey()
+                ? key.getTrackerUrls().stream().flatMap(List::stream)
+                        .filter(value -> value != null && !value.isBlank()).distinct().toList()
+                : List.of(key.getTrackerUrl())).orElse(List.of());
+        return new TorrentMetadata(torrent.getName(), torrent.getSize(), torrent.getFiles().size(), trackers);
     }
 
     private void clearStreamingMediaFiles(String infoHash) {
@@ -2299,7 +2351,7 @@ public final class BtTorrentGateway implements TorrentGateway, AutoCloseable {
         swarmAssistMaintenanceTasks.values().forEach(task -> task.cancel(false)); swarmAssistMaintenanceTasks.clear();
         swarmAssistReplenishTasks.values().forEach(task -> task.cancel(false)); swarmAssistReplenishTasks.clear();
         swarmAssistMaintenance.shutdownNow(); swarmAssistDhtScheduler.close();
-        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear(); streamingPiecePrefixes.clear(); streamingMediaFiles.clear(); streamingPieceSelectors.clear(); streamingPriorityWindows.clear(); selectedFileSessions.clear();
+        seedingSessions.clear(); swarmAssistMagnets.clear(); swarmAssistInitialLookupSuppressed.clear(); swarmAssistStats.clear(); swarmAssistLastPexAt.clear(); recordedHolePunchSuccesses.clear(); publishedRoots.clear(); embeddedTorrentFiles.clear(); observedTorrents.clear(); torrentDiagnosticRoles.clear(); streamingPiecePrefixes.clear(); streamingMediaFiles.clear(); streamingPieceSelectors.clear(); streamingPriorityWindows.clear(); selectedFileSessions.clear();
         BtRuntime active = runtime; runtime = null; transferRuntimeDhtAnnounceEnabled = false; if (active != null) active.shutdown();
         BtRuntime activeIpv6 = ipv6Runtime; ipv6Runtime = null; if (activeIpv6 != null) activeIpv6.shutdown();
         utpBridge.close(); utpTransport = null;

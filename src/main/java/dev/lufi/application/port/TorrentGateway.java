@@ -8,6 +8,15 @@ import java.util.function.Consumer;
 /** Porta para o motor P2P. Implementações devem verificar cada peça antes de expô-la ao player. */
 public interface TorrentGateway {
     StreamingSession open(MagnetLink magnet, WatchMode mode);
+    /** Cancela uma abertura usada somente para consultar metadata antes da confirmação do usuário. */
+    default void cancelOpen(String infoHash) { }
+    default StreamingSession open(TorrentOpenRequest request, WatchMode mode) { return open(request.magnet(), mode); }
     default StreamingSession open(MagnetLink magnet, WatchMode mode, Consumer<TorrentContent> onMetadata) { return open(magnet, mode); }
+    default StreamingSession open(TorrentOpenRequest request, WatchMode mode, Consumer<TorrentContent> onMetadata) {
+        return open(request.magnet(), mode, onMetadata);
+    }
     default StreamingSession open(MagnetLink magnet, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) { return open(magnet, mode, onMetadata); }
+    default StreamingSession open(TorrentOpenRequest request, WatchMode mode, String selectedRelativePath, Consumer<TorrentContent> onMetadata) {
+        return open(request.magnet(), mode, selectedRelativePath, onMetadata);
+    }
 }

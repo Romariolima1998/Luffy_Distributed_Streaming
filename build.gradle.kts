@@ -201,3 +201,42 @@ tasks.register<Exec>("windowsAppImage") {
     )
     outputs.dir(appImageDestination.map { it.resolve("Luffy") })
 }
+
+/**
+ * Gera um instalador Windows. Diferentemente de windowsAppImage, o instalador
+ * registra Luffy nas capacidades do sistema para magnet: e arquivos .torrent,
+ * sem substituir a escolha padrão do usuário.
+ *
+ * Requer WiX Toolset na máquina que gera o pacote, como exigido pelo jpackage.
+ */
+tasks.register<Exec>("windowsInstaller") {
+    group = "distribution"
+    description = "Gera o instalador Windows do Luffy com suporte a magnet e .torrent."
+    val executableJar = tasks.named<Jar>("executableJar")
+    val installerDestination = providers.gradleProperty("windowsInstallerDestination")
+        .map { file(it) }
+        .orElse(layout.buildDirectory.dir("windows-installer").map { it.asFile })
+    dependsOn(executableJar)
+    inputs.file(executableJar.flatMap { it.archiveFile })
+    inputs.dir(layout.projectDirectory.dir("src/windows/jpackage"))
+    val jpackage = javaToolchains.launcherFor {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }.get().metadata.installationPath.file("bin/jpackage.exe").asFile
+    executable = jpackage.absolutePath
+    args(
+        "--type", "exe",
+        "--dest", installerDestination.get().absolutePath,
+        "--input", layout.buildDirectory.dir("libs").get().asFile.absolutePath,
+        "--name", "Luffy",
+        "--main-jar", "Luffy-0.1.0-all.jar",
+        "--main-class", "dev.lufi.ui.LuffyLauncher",
+        "--java-options", "-Dfile.encoding=UTF-8",
+        "--vendor", "Luffy",
+        "--description", "Streaming e downloads BitTorrent no Luffy",
+        "--win-dir-chooser",
+        "--win-menu",
+        "--win-shortcut",
+        "--resource-dir", layout.projectDirectory.dir("src/windows/jpackage").asFile.absolutePath
+    )
+    outputs.dir(installerDestination)
+}

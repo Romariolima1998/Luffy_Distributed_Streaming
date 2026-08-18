@@ -2,6 +2,9 @@ package dev.lufi.ui;
 
 import dev.lufi.application.WatchVideo;
 import dev.lufi.application.port.TorrentContent;
+import dev.lufi.application.TorrentOpenService;
+import dev.lufi.application.port.TorrentMetadata;
+import dev.lufi.application.port.TorrentOpenRequest;
 import dev.lufi.domain.StreamingSession;
 import dev.lufi.domain.WatchMode;
 import dev.lufi.infrastructure.LocalVideoScanner;
@@ -61,6 +64,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /** Ponto de entrada da aplicação desktop. Operações de I/O são executadas fora da thread JavaFX. */
 public final class LufiApplication extends Application {
     private static final long PLAYER_POSITION_LOG_INTERVAL_NANOS = 5_000_000_000L;
+    private static volatile LuffySingleInstance singleInstanceCoordinator;
     private final SqliteDatabase database = new SqliteDatabase(Path.of(System.getProperty("user.home"), ".lufi"));
     private final SettingsRepository settings = new SettingsRepository(database);
     private final LibraryRepository libraryRepository = new LibraryRepository(database);
@@ -95,7 +99,10 @@ public final class LufiApplication extends Application {
     private final AtomicBoolean savedLibrariesLoaded = new AtomicBoolean();
     /** Garante que fechar a janela e Application.stop não deixem áudio ou rede rodando em segundo plano. */
     private final AtomicBoolean applicationShutdown = new AtomicBoolean();
+    /** Um argumento recebido ao iniciar pelo sistema operacional só pode abrir um diálogo. */
+    private final AtomicBoolean startupTorrentArgumentHandled = new AtomicBoolean();
     private final WatchVideo watchVideo = new WatchVideo(torrents);
+    private final TorrentOpenService torrentOpenService = new TorrentOpenService();
     private final Label status = new Label("Pronto para receber um magnet link.");
     private TextArea connectivityPanelOutput;
     private TextArea peerPanelOutput;
@@ -155,6 +162,14 @@ public final class LufiApplication extends Application {
         });
         if (settings.get("cache.max.gb").isEmpty()) showOnboarding(stage); else showMain(stage);
     }
+
+    static void setSingleInstanceCoordinator(LuffySingleInstance coordinator) {
+        singleInstanceCoordinator = coordinator;
+    }
+
+    static void clearSingleInstanceCoordinator() {
+        singleInstanceCoordinator = null;
+    }
     private void showOnboarding(Stage stage) {
         Label title = new Label("Bem-vindo ao Luffy"); title.getStyleClass().add("hero");
         Label intro = new Label("Quanto espaço deseja reservar para o cache e compartilhamento?");
@@ -186,7 +201,11 @@ public final class LufiApplication extends Application {
                 }));
         torrents.setSwarmAssistActivityListener(swarmAssistManager::recordActivity);
         swarmAssistManager.startMaintenance();
-        Platform.runLater(this::configureAutomaticConnectivity);
+        installSingleInstanceRequestHandler();
+        Platform.runLater(() -> {
+            configureAutomaticConnectivity();
+            openStartupTorrentArgument();
+        });
     }
     private HBox header() {
         Label logo = new Label("luffy"); logo.getStyleClass().add("logo");
@@ -207,9 +226,52 @@ public final class LufiApplication extends Application {
         if (packaged != null && !packaged.isBlank()) return Path.of(packaged);
         return ProcessHandle.current().info().command().map(Path::of).orElse(Path.of(System.getProperty("java.home"), "bin", "java.exe"));
     }
+
+    /** Trata magnet e .torrent entregues pelo Windows/Linux sem criar um segundo fluxo de abertura. */
+    private void openStartupTorrentArgument() {
+        if (!startupTorrentArgumentHandled.compareAndSet(false, true)) return;
+        getParameters().getRaw().stream()
+                .filter(this::isTorrentOpenArgument)
+                .findFirst()
+                .ifPresent(this::askWatchMode);
+    }
+
+    /** Recebe um magnet ou .torrent enviado por uma segunda chamada do Luffy.exe. */
+    private void installSingleInstanceRequestHandler() {
+        LuffySingleInstance coordinator = singleInstanceCoordinator;
+        if (coordinator == null) return;
+        coordinator.setRequestHandler(request -> Platform.runLater(() -> openForwardedTorrent(request)));
+    }
+
+    private void openForwardedTorrent(LuffySingleInstance.Request request) {
+        if (primaryStage != null) {
+            primaryStage.show();
+            primaryStage.setIconified(false);
+            primaryStage.toFront();
+            primaryStage.requestFocus();
+        }
+        if (request.kind() == LuffySingleInstance.RequestKind.ACTIVATE) return;
+        try {
+            TorrentOpenRequest source = switch (request.kind()) {
+                case MAGNET -> torrentOpenService.openMagnet(request.value());
+                case TORRENT_FILE -> torrentOpenService.openTorrentFile(Path.of(request.value()));
+                case ACTIVATE -> throw new IllegalStateException("Pedido local sem torrent.");
+            };
+            showAddTorrentDialog(source);
+        } catch (IllegalArgumentException error) {
+            status.setText(error.getMessage());
+        }
+    }
+
+    private boolean isTorrentOpenArgument(String value) {
+        if (value == null) return false;
+        String input = value.trim();
+        return input.regionMatches(true, 0, "magnet:?", 0, "magnet:?".length())
+                || input.toLowerCase(Locale.ROOT).endsWith(".torrent");
+    }
     private Tab watchTab() {
-        TextField magnet = new TextField(); magnet.setPromptText("Cole um magnet:?xt=urn:btih:…"); magnet.setPrefWidth(620);
-        Button open = new Button("Abrir magnet");
+        TextField magnet = new TextField(); magnet.setPromptText("Cole um magnet ou o caminho de um arquivo .torrent"); magnet.setPrefWidth(620);
+        Button open = new Button("Abrir");
         open.setOnAction(e -> askWatchMode(magnet.getText()));
         Label heading = new Label("Assistir"); heading.getStyleClass().add("section-title");
         Label hint = new Label("A reprodução começa quando o buffer de segurança estiver disponível."); hint.getStyleClass().add("muted");
@@ -702,24 +764,105 @@ public final class LufiApplication extends Application {
         return new Tab();
     }
     private void askWatchMode(String raw) {
-        Alert choice = new Alert(Alert.AlertType.CONFIRMATION); choice.setTitle("Como deseja abrir o magnet?"); choice.setHeaderText("Escolha o comportamento do download");
-        ButtonType temporary = new ButtonType("Assistir apenas");
-        ButtonType share = new ButtonType("Assistir e compartilhar");
-        ButtonType download = new ButtonType("Apenas baixar");
-        choice.getButtonTypes().setAll(temporary, share, download, ButtonType.CANCEL);
-        choice.showAndWait().ifPresent(result -> {
-            if (result == temporary) openSession(raw, WatchMode.TEMPORARY);
-            else if (result == share) openSession(raw, WatchMode.SHARE);
-            else if (result == download) openSession(raw, WatchMode.DOWNLOAD);
+        TorrentOpenRequest source;
+        try {
+            source = torrentOpenService.open(raw);
+        } catch (IllegalArgumentException error) {
+            status.setText(error.getMessage());
+            return;
+        }
+        showAddTorrentDialog(source);
+    }
+
+    /**
+     * Confirma a abertura independentemente da origem. Arquivos .torrent já
+     * exibem seus dados; magnets atualizam os mesmos campos assim que a
+     * metadata chega pela sessão de prévia.
+     */
+    private void showAddTorrentDialog(TorrentOpenRequest source) {
+        Alert dialog = new Alert(Alert.AlertType.CONFIRMATION);
+        dialog.setTitle("Adicionar torrent");
+        dialog.setHeaderText("Adicionar torrent");
+
+        Label name = new Label();
+        Label size = new Label();
+        Label files = new Label();
+        Label trackers = new Label();
+        Label sourceLabel = new Label(source.hasEmbeddedMetadata() ? "Fonte: arquivo .torrent" : "Fonte: magnet link");
+        sourceLabel.getStyleClass().add("muted");
+        GridPane details = new GridPane();
+        details.setHgap(14); details.setVgap(9);
+        details.addRow(0, new Label("Nome:"), name);
+        details.addRow(1, new Label("Tamanho:"), size);
+        details.addRow(2, new Label("Arquivos:"), files);
+        details.addRow(3, new Label("Trackers:"), trackers);
+        GridPane.setHgrow(name, Priority.ALWAYS);
+        name.setWrapText(true);
+        VBox content = new VBox(12, sourceLabel, details);
+        dialog.getDialogPane().setContent(content);
+
+        renderTorrentSummary(source.metadata().orElse(null), source, name, size, files, trackers);
+        AtomicBoolean metadataPreviewStarted = new AtomicBoolean();
+        if (source.metadata().isEmpty()) {
+            metadataPreviewStarted.set(true);
+            status.setText("Buscando metadados para adicionar o magnet…");
+            try {
+                watchVideo.execute(source, WatchMode.TEMPORARY, torrent -> Platform.runLater(() -> {
+                    if (!dialog.isShowing()) return;
+                    renderTorrentSummary(torrent.metadata(), source, name, size, files, trackers);
+                }));
+            } catch (IllegalArgumentException error) {
+                metadataPreviewStarted.set(false);
+                status.setText(error.getMessage());
+            }
+        }
+
+        ButtonType temporary = new ButtonType("Assistir", ButtonBar.ButtonData.OK_DONE);
+        ButtonType share = new ButtonType("Assistir e compartilhar", ButtonBar.ButtonData.OTHER);
+        ButtonType download = new ButtonType("Download", ButtonBar.ButtonData.APPLY);
+        dialog.getButtonTypes().setAll(ButtonType.CANCEL, download, temporary, share);
+        dialog.showAndWait().ifPresentOrElse(result -> {
+            if (metadataPreviewStarted.get()) torrents.cancelOpen(source.magnet().infoHash());
+            if (result == temporary) openSession(source, WatchMode.TEMPORARY);
+            else if (result == share) openSession(source, WatchMode.SHARE);
+            else if (result == download) openSession(source, WatchMode.DOWNLOAD);
+        }, () -> {
+            if (metadataPreviewStarted.get()) torrents.cancelOpen(source.magnet().infoHash());
         });
     }
-    private void openSession(String raw, WatchMode mode) {
+
+    private void renderTorrentSummary(TorrentMetadata metadata, TorrentOpenRequest source, Label name, Label size,
+                                      Label files, Label trackers) {
+        if (metadata == null) {
+            name.setText(source.magnet().displayName().orElse("Aguardando metadata"));
+            size.setText("Aguardando metadata");
+            files.setText("Aguardando metadata");
+            trackers.setText(source.magnet().trackers().isEmpty()
+                    ? "Aguardando metadata" : source.magnet().trackers().size() + " informado(s) no magnet");
+            return;
+        }
+        name.setText(metadata.name());
+        size.setText(formatBytes(metadata.sizeBytes()));
+        files.setText(Integer.toString(metadata.fileCount()));
+        int trackerCount = metadata.trackers().isEmpty() ? source.magnet().trackers().size() : metadata.trackers().size();
+        trackers.setText(Integer.toString(trackerCount));
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        String[] units = {"KB", "MB", "GB", "TB"};
+        double value = bytes;
+        int unit = -1;
+        do { value /= 1024d; unit++; } while (value >= 1024d && unit < units.length - 1);
+        return String.format(Locale.ROOT, value >= 100d ? "%.0f %s" : "%.1f %s", value, units[unit]);
+    }
+    private void openSession(TorrentOpenRequest source, WatchMode mode) {
         try {
-            var magnet = dev.lufi.domain.MagnetLink.parse(raw.trim());
+            var magnet = source.magnet();
             transitionPreviousWatchIfNeeded(magnet.infoHash());
             if (mode.isTemporary()) swarmAssistManager.recordUserInteraction(magnet.infoHash());
             if (mode.isPersistentDownload()) removeWatchOnlySwarm(magnet.infoHash());
-            watchContext = new WatchContext(raw.trim(), mode);
+            watchContext = new WatchContext(source, mode);
             activeWatchInfoHash = magnet.infoHash();
             pendingWatchPath = null;
             selectedStreamingPath = null;
@@ -731,8 +874,8 @@ public final class LufiApplication extends Application {
                 status.setText("Arquivos recebidos. Clique em uma música ou vídeo para iniciar somente esse arquivo; nada foi baixado ainda.");
                 return;
             }
-            StreamingSession session = watchVideo.execute(raw, mode, content -> Platform.runLater(() -> {
-                if (isCurrentWatchMetadata(metadataRequest, magnet.infoHash())) onTorrentMetadata(content, raw, mode);
+            StreamingSession session = watchVideo.execute(source, mode, content -> Platform.runLater(() -> {
+                if (isCurrentWatchMetadata(metadataRequest, magnet.infoHash())) onTorrentMetadata(content, magnet.toUri(), mode);
             }));
             status.setText(mode == WatchMode.DOWNLOAD
                     ? "Buscando metadados de \"" + session.title() + "\". Todos os arquivos serão baixados em sequência."
@@ -867,9 +1010,9 @@ public final class LufiApplication extends Application {
                 : entry.playableMedia()
                 ? "Buscando peers para a mídia selecionada. Apenas este arquivo será baixado."
                 : "Buscando peers para o arquivo selecionado. Apenas este arquivo será baixado.");
-        try { watchVideo.execute(context.magnet(), context.mode(), entry.relativePath(), content -> Platform.runLater(() -> {
+        try { watchVideo.execute(context.source(), context.mode(), entry.relativePath(), content -> Platform.runLater(() -> {
             if (isCurrentWatchMetadata(metadataRequest, contextInfoHash)) {
-                onTorrentMetadata(content, context.magnet(), context.mode());
+                onTorrentMetadata(content, context.source().magnet().toUri(), context.mode());
             }
         })); }
         catch (IllegalArgumentException error) { status.setText(error.getMessage()); }
@@ -1464,7 +1607,7 @@ public final class LufiApplication extends Application {
     private record WatchEntry(String name, String relativePath, Path path, boolean playableMedia) {
         @Override public String toString() { return (playableMedia ? "▶ " : "📄 ") + name; }
     }
-    private record WatchContext(String magnet, WatchMode mode) { }
+    private record WatchContext(TorrentOpenRequest source, WatchMode mode) { }
     private record LibraryNode(String name, Path path, boolean video) {
         @Override public String toString() { return (video ? "▶ " : "📁 ") + name; }
     }

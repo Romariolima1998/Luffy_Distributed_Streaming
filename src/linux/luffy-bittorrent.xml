@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-bittorrent">
+    <comment>Arquivo BitTorrent</comment>
+    <glob pattern="*.torrent"/>
+  </mime-type>
+  <mime-type type="application/x-torrent">
+    <comment>Arquivo torrent</comment>
+    <glob pattern="*.torrent"/>
+  </mime-type>
+</mime-info>

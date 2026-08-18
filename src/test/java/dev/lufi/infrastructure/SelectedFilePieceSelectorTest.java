@@ -7,6 +7,20 @@ import org.junit.jupiter.api.Test;
 
 class SelectedFilePieceSelectorTest {
     @Test
+    void permitsAvailablePiecesOnlyUntilTheInitialSelectionIsKnown() {
+        SelectedFilePieceSelector selector = new SelectedFilePieceSelector();
+        BitSet available = new BitSet();
+        available.set(1);
+        available.set(3);
+
+        assertArrayEquals(new int[] {1, 3}, selector.getNextPieces(available, null).toArray());
+
+        selector.select(new BitSet());
+
+        assertArrayEquals(new int[0], selector.getNextPieces(available, null).toArray());
+    }
+
+    @Test
     void changesTheAllowedPiecesWithoutCreatingAnotherSelector() {
         SelectedFilePieceSelector selector = new SelectedFilePieceSelector();
         BitSet first = new BitSet();
