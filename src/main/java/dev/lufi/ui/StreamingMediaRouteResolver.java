@@ -25,6 +25,15 @@ final class StreamingMediaRouteResolver {
         return Route.WAIT_FOR_BUFFER;
     }
 
+    static Route resolve(BtTorrentGateway.StreamingFileBufferStatus buffer, Path file) {
+        Objects.requireNonNull(buffer, "buffer");
+        Objects.requireNonNull(file, "file");
+        LocalFileMediaSource localFile = new LocalFileMediaSource(file);
+        if (buffer.complete() && localFile.isReadableFile()) return Route.LOCAL_FILE_DIRECT;
+        if (buffer.playable() && Files.isRegularFile(file) && readableSize(file) > 0L) return Route.LOCAL_HTTP;
+        return Route.WAIT_FOR_BUFFER;
+    }
+
     private static boolean isComplete(BtTorrentGateway.StreamingBufferStatus buffer) {
         return buffer.totalPieces() > 0 && buffer.verifiedPieces() >= buffer.totalPieces();
     }

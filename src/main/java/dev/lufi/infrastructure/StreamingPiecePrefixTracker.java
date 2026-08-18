@@ -30,6 +30,17 @@ final class StreamingPiecePrefixTracker {
         }
     }
 
+    /** Number of consecutive verified pieces from a file's first piece onward. */
+    int contiguousFrom(String infoHash, int firstPiece, int lastPiece) {
+        if (infoHash == null || infoHash.isBlank() || firstPiece < 0 || lastPiece < firstPiece) return 0;
+        BitSet verified = verifiedByInfoHash.get(normalize(infoHash));
+        if (verified == null) return 0;
+        synchronized (verified) {
+            int firstMissing = verified.nextClearBit(firstPiece);
+            return Math.max(0, Math.min(lastPiece + 1, firstMissing) - firstPiece);
+        }
+    }
+
     /** Returns true only when every piece in the inclusive interval was hash-verified. */
     boolean containsAll(String infoHash, int firstPiece, int lastPiece) {
         if (infoHash == null || infoHash.isBlank() || firstPiece < 0 || lastPiece < firstPiece) return false;

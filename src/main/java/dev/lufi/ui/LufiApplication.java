@@ -165,6 +165,7 @@ public final class LufiApplication extends Application {
         stage.setScene(scene(root)); stage.setTitle("Luffy"); stage.show();
     }
     private void showMain(Stage stage) {
+        torrents.setPersistentDownloadStatusListener(status -> Platform.runLater(() -> updatePersistentLibraryStatus(status)));
         tabs = new TabPane(watchTab(), libraryTab(), settingsTab(), diagnosticsTab(), logsTab()); tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
         tabs.setTabMinWidth(130);
         BorderPane root = new BorderPane(tabs); root.setTop(header()); root.setPadding(new Insets(0, 24, 24, 24));
@@ -509,6 +510,7 @@ public final class LufiApplication extends Application {
     }
     private Tab libraryTab() {
         Button add = new Button("Adicionar biblioteca"); add.setOnAction(e -> selectLibrary());
+        Button openFolder = new Button("Abrir pasta"); openFolder.setOnAction(e -> openSelectedLibraryFolder());
         Button watchSelected = new Button("Assistir selecionado"); watchSelected.setOnAction(e -> watchSelectedVideo());
         Button copyMagnet = new Button("Copiar link selecionado"); copyMagnet.setOnAction(e -> copyMagnet());
         Label heading = new Label("Meus vídeos"); heading.getStyleClass().add("section-title");
@@ -524,7 +526,8 @@ public final class LufiApplication extends Application {
         });
         Region spacer = new Region(); HBox.setHgrow(spacer, Priority.ALWAYS);
         HBox toolbar = new HBox(12, heading, spacer, add); toolbar.setAlignment(Pos.CENTER_LEFT);
-        VBox left = new VBox(10, libraryLabel, libraries); left.getStyleClass().add("library-panel"); left.setMinWidth(220); VBox.setVgrow(libraries, Priority.ALWAYS);
+        HBox libraryActions = new HBox(openFolder); libraryActions.setAlignment(Pos.CENTER_RIGHT);
+        VBox left = new VBox(10, libraryLabel, libraries, libraryActions); left.getStyleClass().add("library-panel"); left.setMinWidth(220); VBox.setVgrow(libraries, Priority.ALWAYS);
         HBox videoActions = new HBox(watchSelected); videoActions.setAlignment(Pos.CENTER_RIGHT);
         VBox content = new VBox(10, libraryTitle, contentLabel, videos, videoActions); content.getStyleClass().add("content-panel"); VBox.setVgrow(videos, Priority.ALWAYS);
         magnets.setPrefHeight(62); magnets.setMaxHeight(82);
@@ -699,16 +702,23 @@ public final class LufiApplication extends Application {
         return new Tab();
     }
     private void askWatchMode(String raw) {
-        Alert choice = new Alert(Alert.AlertType.CONFIRMATION); choice.setTitle("Como deseja assistir?"); choice.setHeaderText("Escolha o comportamento do cache");
-        ButtonType temporary = new ButtonType("Assistir apenas"); ButtonType share = new ButtonType("Assistir e compartilhar"); choice.getButtonTypes().setAll(temporary, share, ButtonType.CANCEL);
-        choice.showAndWait().ifPresent(result -> { if (result != ButtonType.CANCEL) openSession(raw, result == share ? WatchMode.SHARE : WatchMode.TEMPORARY); });
+        Alert choice = new Alert(Alert.AlertType.CONFIRMATION); choice.setTitle("Como deseja abrir o magnet?"); choice.setHeaderText("Escolha o comportamento do download");
+        ButtonType temporary = new ButtonType("Assistir apenas");
+        ButtonType share = new ButtonType("Assistir e compartilhar");
+        ButtonType download = new ButtonType("Apenas baixar");
+        choice.getButtonTypes().setAll(temporary, share, download, ButtonType.CANCEL);
+        choice.showAndWait().ifPresent(result -> {
+            if (result == temporary) openSession(raw, WatchMode.TEMPORARY);
+            else if (result == share) openSession(raw, WatchMode.SHARE);
+            else if (result == download) openSession(raw, WatchMode.DOWNLOAD);
+        });
     }
     private void openSession(String raw, WatchMode mode) {
         try {
             var magnet = dev.lufi.domain.MagnetLink.parse(raw.trim());
             transitionPreviousWatchIfNeeded(magnet.infoHash());
-            if (mode == WatchMode.TEMPORARY) swarmAssistManager.recordUserInteraction(magnet.infoHash());
-            if (mode == WatchMode.SHARE) removeWatchOnlySwarm(magnet.infoHash());
+            if (mode.isTemporary()) swarmAssistManager.recordUserInteraction(magnet.infoHash());
+            if (mode.isPersistentDownload()) removeWatchOnlySwarm(magnet.infoHash());
             watchContext = new WatchContext(raw.trim(), mode);
             activeWatchInfoHash = magnet.infoHash();
             pendingWatchPath = null;
@@ -724,7 +734,9 @@ public final class LufiApplication extends Application {
             StreamingSession session = watchVideo.execute(raw, mode, content -> Platform.runLater(() -> {
                 if (isCurrentWatchMetadata(metadataRequest, magnet.infoHash())) onTorrentMetadata(content, raw, mode);
             }));
-            status.setText("Buscando os metadados de “" + session.title() + "”. Nenhum arquivo será baixado antes da sua escolha.");
+            status.setText(mode == WatchMode.DOWNLOAD
+                    ? "Buscando metadados de \"" + session.title() + "\". Todos os arquivos serão baixados em sequência."
+                    : "Buscando metadados de \"" + session.title() + "\". Nenhum arquivo será baixado antes da sua escolha.");
             torrents.checkDhtReachability();
         } catch (IllegalArgumentException ex) { status.setText(ex.getMessage()); }
     }
@@ -745,11 +757,12 @@ public final class LufiApplication extends Application {
     }
     private void onTorrentMetadata(TorrentContent content, String magnet, WatchMode mode) {
         Path folder = content.folder();
-        // A prévia de metadados de “Assistir e compartilhar” usa cache temporário.
-        // A pasta permanente só é criada após a escolha de um arquivo.
-        if (mode == WatchMode.SHARE && selectedStreamingPath != null) {
+        // “Apenas baixar” já começa a transferência após os metadados. “Assistir e
+        // compartilhar” cria a pasta persistente depois que o usuário escolhe um arquivo.
+        if (mode == WatchMode.DOWNLOAD || (mode == WatchMode.SHARE && selectedStreamingPath != null)) {
             LibraryRepository.Library saved = libraryRepository.save(folder, magnet, null);
-            LibraryView library = new LibraryView(saved.name(), saved.path(), saved.magnet(), null, true);
+            LibraryView library = new LibraryView(saved.name(), saved.path(), saved.magnet(), null,
+                    LibraryTransferState.DOWNLOADING);
             addOrReplaceLibrary(library);
             libraries.getSelectionModel().select(library);
         }
@@ -768,9 +781,7 @@ public final class LufiApplication extends Application {
         watchPlaylist.getItems().setAll(entries);
         if (entries.isEmpty()) loadWatchPlaylist(content.folder());
         else {
-            status.setText(selectedStreamingPath == null
-                    ? "Lista de arquivos recebida. Clique em uma música, vídeo ou arquivo para baixar somente ele."
-                    : selectedFileStatus());
+            status.setText(watchPlaylistStatus());
             if (pendingWatchPath != null) {
                 String requestedPath = pendingWatchPath;
                 pendingWatchPath = null;
@@ -790,9 +801,7 @@ public final class LufiApplication extends Application {
                         Platform.runLater(() -> {
                             watchPlaylist.getItems().setAll(found.stream().map(path -> watchEntry(path.getFileName().toString(),
                                     folder.relativize(path).toString().replace('\\', '/'), path)).toList());
-                            status.setText(selectedStreamingPath == null
-                                    ? "Lista de arquivos recebida. Clique em um arquivo para baixar somente ele."
-                                    : selectedFileStatus());
+                            status.setText(watchPlaylistStatus());
                         });
                         return;
                     }
@@ -821,9 +830,21 @@ public final class LufiApplication extends Application {
         return List.of(".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpeg", ".mpg", ".ts", ".m2ts", ".mts", ".wmv", ".flv", ".3gp", ".ogv", ".vob", ".asf").stream().anyMatch(name::endsWith);
     }
     private String selectedFileStatus() {
-        return watchContext != null && watchContext.mode() == WatchMode.SHARE
-                ? "Baixando e compartilhando somente o arquivo selecionado em Documentos\\Luffy."
-                : "Baixando temporariamente somente o arquivo selecionado para reprodução.";
+        if (watchContext == null || watchContext.mode().isTemporary()) {
+            return "Baixando temporariamente somente o arquivo selecionado para reprodução.";
+        }
+        if (watchContext.mode() == WatchMode.DOWNLOAD) {
+            return "Baixando todos os arquivos deste magnet em sequência em Documentos\\Luffy.";
+        }
+        return "Baixando e compartilhando o arquivo selecionado em Documentos\\Luffy.";
+    }
+    private String watchPlaylistStatus() {
+        if (watchContext != null && watchContext.mode() == WatchMode.DOWNLOAD) {
+            return "Lista recebida. Todos os arquivos serão baixados em sequência; clique em uma mídia para reproduzir.";
+        }
+        return selectedStreamingPath == null
+                ? "Lista de arquivos recebida. Clique em uma música, vídeo ou arquivo para baixar somente ele."
+                : selectedFileStatus();
     }
     private void openWatchEntry(WatchEntry entry) {
         if (watchContext == null) { status.setText("Cole um magnet antes de escolher um arquivo."); return; }
@@ -841,7 +862,9 @@ public final class LufiApplication extends Application {
         long metadataRequest = streamingRequest.incrementAndGet();
         WatchContext context = watchContext;
         String contextInfoHash = activeWatchInfoHash;
-        status.setText(entry.playableMedia()
+        status.setText(watchContext.mode() == WatchMode.DOWNLOAD
+                ? "Preparando o arquivo selecionado para reprodução; a fila de download continua ativa."
+                : entry.playableMedia()
                 ? "Buscando peers para a mídia selecionada. Apenas este arquivo será baixado."
                 : "Buscando peers para o arquivo selecionado. Apenas este arquivo será baixado.");
         try { watchVideo.execute(context.magnet(), context.mode(), entry.relativePath(), content -> Platform.runLater(() -> {
@@ -940,14 +963,52 @@ public final class LufiApplication extends Application {
         }
         libraries.getItems().add(library);
     }
+    /** Keeps the library list honest while a persistent magnet is downloading or seeding. */
+    private void updatePersistentLibraryStatus(BtTorrentGateway.PersistentDownloadStatus update) {
+        LibraryTransferState next = update.state() == BtTorrentGateway.PersistentDownloadState.SEEDING
+                ? LibraryTransferState.SEEDING : LibraryTransferState.DOWNLOADING;
+        for (int index = 0; index < libraries.getItems().size(); index++) {
+            LibraryView current = libraries.getItems().get(index);
+            if (!current.path().toAbsolutePath().normalize().equals(update.folder().toAbsolutePath().normalize())) continue;
+            LibraryView replacement = current.withTransferState(next);
+            libraries.getItems().set(index, replacement);
+            LibraryView selected = libraries.getSelectionModel().getSelectedItem();
+            if (selected != null && selected.path().equals(current.path())) {
+                libraries.getSelectionModel().select(replacement);
+                libraryTitle.setText(libraryTitle(replacement));
+            }
+            status.setText(next == LibraryTransferState.SEEDING
+                    ? "Download concluído. A biblioteca agora está semeando."
+                    : "Baixando os arquivos da biblioteca em sequência.");
+            return;
+        }
+    }
+    private void openSelectedLibraryFolder() {
+        LibraryView selected = libraries.getSelectionModel().getSelectedItem();
+        if (selected == null) { status.setText("Selecione uma biblioteca antes de abrir a pasta."); return; }
+        Path folder = selected.path();
+        Thread.startVirtualThread(() -> {
+            try {
+                if (!Files.isDirectory(folder)) throw new IllegalStateException("A pasta selecionada não está disponível.");
+                if (!java.awt.Desktop.isDesktopSupported()) throw new IllegalStateException("O sistema não permite abrir pastas automaticamente.");
+                java.awt.Desktop.getDesktop().open(folder.toFile());
+                Platform.runLater(() -> status.setText("Pasta da biblioteca aberta."));
+            } catch (Exception error) {
+                Platform.runLater(() -> status.setText("Não foi possível abrir a pasta: " + error.getMessage()));
+            }
+        });
+    }
     private void openLibrary(LibraryView library) {
-        libraryTitle.setText(library.name() + (library.seeding() ? "  •  semeando" : "  •  cache P2P"));
+        libraryTitle.setText(libraryTitle(library));
         if (library.magnet() != null) magnets.getItems().setAll(library.magnet()); else magnets.getItems().clear();
         status.setText("Abrindo “" + library.name() + "”…");
         Task<List<Path>> scan = new Task<>() { @Override protected List<Path> call() throws Exception { return new LocalVideoScanner().scan(library.path()); } };
-        scan.setOnSucceeded(e -> { populateVideoTree(library.path(), scan.getValue()); status.setText(library.name() + ": " + scan.getValue().size() + " vídeo(s) disponíveis" + (library.seeding() ? " e semeando." : ".")); });
+        scan.setOnSucceeded(e -> { populateVideoTree(library.path(), scan.getValue()); status.setText(library.name() + ": " + scan.getValue().size() + " vídeo(s) disponíveis • " + library.transferState().label() + "."); });
         scan.setOnFailed(e -> status.setText("Não foi possível abrir a biblioteca: " + scan.getException().getMessage()));
         Thread.startVirtualThread(scan);
+    }
+    private String libraryTitle(LibraryView library) {
+        return library.name() + "  •  " + library.transferState().label();
     }
     private void populateVideoTree(Path rootPath, List<Path> foundVideos) {
         TreeItem<LibraryNode> root = new TreeItem<>(new LibraryNode(rootPath.getFileName().toString(), rootPath, false));
@@ -1292,11 +1353,11 @@ public final class LufiApplication extends Application {
                 int lastVerifiedPieces = -1;
                 boolean waitingForMediaDescription = false;
                 while (streamingRequest.get() == requestId) {
-                    BtTorrentGateway.StreamingBufferStatus buffer = torrents.streamingBufferStatus(infoHash);
+                    BtTorrentGateway.StreamingFileBufferStatus buffer = torrents.streamingFileBufferStatus(infoHash, video.path());
                     StreamingMediaRouteResolver.Route route = StreamingMediaRouteResolver.resolve(buffer, video.path());
                     if (route == StreamingMediaRouteResolver.Route.LOCAL_FILE_DIRECT) {
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM LOCAL FILE READY: requestId=" + requestId
-                                + "; infoHash=" + infoHash + "; route=LOCAL_FILE_DIRECT; http=not-used; pieces="
+                                + "; infoHash=" + infoHash + "; route=LOCAL_FILE_DIRECT; http=not-used; filePieces="
                                 + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; path=" + video.path() + ".");
                         Platform.runLater(() -> {
                             if (streamingRequest.get() == requestId) playLocal(video);
@@ -1321,7 +1382,7 @@ public final class LufiApplication extends Application {
                             continue;
                         }
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER READY: requestId=" + requestId + "; infoHash="
-                                + infoHash + "; route=LOCAL_HTTP; downloadedBytes=" + buffer.downloadedBytes() + "; pieces="
+                                + infoHash + "; route=LOCAL_HTTP; filePieces="
                                 + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
                                 + buffer.contiguousPrefixPieces() + "; required=" + buffer.requiredPrefixPieces()
                                 + "; fileBytes=" + Files.size(video.path()) + "; mediaLength="
@@ -1333,8 +1394,8 @@ public final class LufiApplication extends Application {
                     }
                     if (!buffer.sessionActive()) {
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER ABORT: requestId=" + requestId + "; infoHash="
-                                + infoHash + "; reason=session-inactive; downloadedBytes=" + buffer.downloadedBytes()
-                                + "; pieces=" + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
+                                + infoHash + "; reason=session-inactive; filePieces="
+                                + buffer.verifiedPieces() + "/" + buffer.totalPieces() + "; prefixPieces="
                                 + buffer.contiguousPrefixPieces() + "; fileExists="
                                 + Files.exists(video.path()) + ".");
                         Platform.runLater(() -> {
@@ -1351,8 +1412,8 @@ public final class LufiApplication extends Application {
                         int required = buffer.requiredPieces();
                         long fileBytes = Files.isRegularFile(video.path()) ? Files.size(video.path()) : 0;
                         diagnostics.log(P2pDiagnostics.Layer.DOWNLOAD, "STREAM BUFFER PROGRESS: requestId=" + requestId + "; infoHash="
-                                + infoHash + "; downloadedBytes=" + buffer.downloadedBytes() + "; fileBytes=" + fileBytes
-                                + "; pieces=" + verified + "/" + buffer.totalPieces() + "; prefixPieces="
+                                + infoHash + "; fileBytes=" + fileBytes
+                                + "; filePieces=" + verified + "/" + buffer.totalPieces() + "; prefixPieces="
                                 + buffer.contiguousPrefixPieces() + "; required=" + required
                                 + "; sessionActive=" + buffer.sessionActive() + ".");
                         Platform.runLater(() -> {
@@ -1407,8 +1468,21 @@ public final class LufiApplication extends Application {
     private record LibraryNode(String name, Path path, boolean video) {
         @Override public String toString() { return (video ? "▶ " : "📁 ") + name; }
     }
-    private record LibraryView(String name, Path path, String magnet, Path torrentFile, boolean seeding) {
-        @Override public String toString() { return name + (seeding ? " — semeando" : " — cache P2P"); }
+    private enum LibraryTransferState {
+        DOWNLOADING("baixando"), SEEDING("semeando"), CACHE("cache P2P");
+        private final String label;
+        LibraryTransferState(String label) { this.label = label; }
+        String label() { return label; }
+    }
+    private record LibraryView(String name, Path path, String magnet, Path torrentFile, LibraryTransferState transferState) {
+        LibraryView(String name, Path path, String magnet, Path torrentFile, boolean seeding) {
+            this(name, path, magnet, torrentFile, seeding ? LibraryTransferState.SEEDING : LibraryTransferState.CACHE);
+        }
+        boolean seeding() { return transferState == LibraryTransferState.SEEDING; }
+        LibraryView withTransferState(LibraryTransferState state) {
+            return new LibraryView(name, path, magnet, torrentFile, state);
+        }
+        @Override public String toString() { return name + " — " + transferState.label(); }
     }
     public static void main(String[] args) { launch(args); }
 }

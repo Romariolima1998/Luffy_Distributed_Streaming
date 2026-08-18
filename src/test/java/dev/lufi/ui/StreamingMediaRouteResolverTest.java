@@ -50,4 +50,18 @@ class StreamingMediaRouteResolverTest {
             Files.deleteIfExists(file);
         }
     }
+
+    @Test
+    void usesTheSelectedFilesOwnPieceWindowInsteadOfTheWholeTorrentPrefix() throws Exception {
+        Path file = Files.createTempFile("luffy-stream-route-file-window-", ".mkv");
+        try {
+            Files.writeString(file, "preallocated-content");
+            var selectedFile = new BtTorrentGateway.StreamingFileBufferStatus(2, 2, 8, 2, true);
+
+            assertEquals(StreamingMediaRouteResolver.Route.LOCAL_HTTP,
+                    StreamingMediaRouteResolver.resolve(selectedFile, file));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
 }

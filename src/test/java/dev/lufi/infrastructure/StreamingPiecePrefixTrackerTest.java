@@ -56,4 +56,16 @@ class StreamingPiecePrefixTrackerTest {
         assertFalse(scattered.playable());
         assertTrue(contiguous.playable());
     }
+
+    @Test void tracksTheContinuousPrefixOfALaterSelectedFileIndependently() {
+        StreamingPiecePrefixTracker tracker = new StreamingPiecePrefixTracker();
+        tracker.record("abc", 10);
+        tracker.record("abc", 11);
+        tracker.record("abc", 13);
+
+        assertEquals(2, tracker.contiguousFrom("abc", 10, 15));
+
+        tracker.record("abc", 12);
+        assertEquals(4, tracker.contiguousFrom("abc", 10, 15));
+    }
 }
