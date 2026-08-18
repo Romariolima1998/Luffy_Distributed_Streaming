@@ -1,24 +1,28 @@
 # Luffy
 
-Luffy é uma plataforma de streaming e compartilhamento de vídeos totalmente distribuída (P2P), desenvolvida em Java 21 sobre o protocolo BitTorrent. Seu objetivo é permitir que usuários assistam e compartilhem vídeos diretamente entre si, sem depender de servidores centrais para armazenar ou distribuir o conteúdo.
-
-O projeto utiliza DHT, PEX, uTP e técnicas de travessia de NAT (BEP 55), além de uma camada própria de descoberta e rendezvous para aumentar a conectividade entre peers, buscando uma rede mais escalável, resiliente e descentralizada.
-
-<img alt="Captura de tela 2026-08-04 153810.png" data-hpc="true" containertiming="hpc" src="https://github.com/Romariolima1998/Luffy_Distributed_Streaming/blob/main/imagens/Captura%20de%20tela%202026-08-04%20153810.png?raw=true" style="max-width: 100%;">
-
 ## baixe o luffy e execulte sem compilar
 
+e necessario baixar o vlc 3.0.x antes de rodar o luffy : 
+[site oficial do vlc](https://www.videolan.org/)
 
-[download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/raw/refs/heads/main/Luffyforwindows/Luffy.exe)
 
-[download para linux](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/raw/refs/heads/main/Luffyforlinux/Luffy-0.1.0-linux.zip)
+
+[download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/1.0/Luffy-1.0.exe)
 
 requizito para linux
 
 ```
  sudo apt update && sudo apt install openjdk-21-jdk -y
 ```
+[download para linux](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/0.1.0/Luffy-0.1.0-linux.zip)
 
+
+
+Luffy é uma plataforma de streaming e compartilhamento de vídeos totalmente distribuída (P2P), desenvolvida em Java 21 sobre o protocolo BitTorrent. Seu objetivo é permitir que usuários assistam e compartilhem vídeos diretamente entre si, sem depender de servidores centrais para armazenar ou distribuir o conteúdo.
+
+O projeto utiliza DHT, PEX, uTP e técnicas de travessia de NAT (BEP 55), além de uma camada própria de descoberta e rendezvous para aumentar a conectividade entre peers, buscando uma rede mais escalável, resiliente e descentralizada.
+
+<img alt="Captura de tela 2026-08-04 153810.png" data-hpc="true" containertiming="hpc" src="https://github.com/Romariolima1998/Luffy_Distributed_Streaming/blob/main/imagens/Captura%20de%20tela%202026-08-04%20153810.png?raw=true" style="max-width: 100%;">
 
 
 ## Pré-requisitos e execução caso voce queira compilar
