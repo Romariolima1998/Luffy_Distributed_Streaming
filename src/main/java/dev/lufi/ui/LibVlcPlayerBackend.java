@@ -12,6 +12,7 @@ import uk.co.caprica.vlcj.support.version.Version;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -25,10 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * confinados a esta classe. Nem a UI JavaFX nem o motor BitTorrent conhecem
  * essas APIs.</p>
  *
- * <p>O VLC nativo nao e distribuido por este backend. Ele e localizado no
- * momento de {@link #open(URI)} e uma ausencia e reportada por {@code onError}.
- * Isso permite validar o backend tecnico sem incorporar uma decisao de
- * distribuicao/licenca do runtime VLC ao aplicativo.</p>
+ * <p>Nas distribuições do Luffy, o runtime nativo do VLC é levado no próprio
+ * pacote e descoberto antes de qualquer instalação externa.</p>
  */
 final class LibVlcPlayerBackend implements MediaPlayerBackend {
     private static final int REQUIRED_LIBVLC_MAJOR_VERSION = 3;
@@ -287,7 +286,11 @@ final class LibVlcPlayerBackend implements MediaPlayerBackend {
             // vmem e entram em recursão no conversor. Para esse backend de
             // renderização direta, o decoder de software do próprio libVLC é
             // o caminho estável e ainda preserva todo o pacing A/V do VLC.
-            MediaPlayerFactory factory = new MediaPlayerFactory("--avcodec-hw=none", "--no-video-title-show");
+            List<String> factoryOptions = new ArrayList<>(List.of("--avcodec-hw=none", "--no-video-title-show"));
+            if (!discovery.pluginPath().isBlank()) {
+                factoryOptions.add("--plugin-path=" + discovery.pluginPath());
+            }
+            MediaPlayerFactory factory = new MediaPlayerFactory(factoryOptions.toArray(String[]::new));
             Version nativeVersion = new Version(factory.application().version());
             if (nativeVersion.major() != REQUIRED_LIBVLC_MAJOR_VERSION) {
                 factory.release();

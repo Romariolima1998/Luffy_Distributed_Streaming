@@ -1,0 +1,10 @@
+Package: luffy
+Version: 1.0.0
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: Luffy Project <noreply@luffy.invalid>
+Depends: openjdk-21-jre | java21-runtime | java-runtime, libc6 (>= 2.39)
+Description: Luffy - streaming e downloads BitTorrent
+ Aplicativo JavaFX para BitTorrent, streaming local e reprodução multimídia.
+ Este pacote inclui o runtime libVLC, codecs e plugins necessários para o player.

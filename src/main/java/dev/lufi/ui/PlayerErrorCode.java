@@ -8,7 +8,7 @@ package dev.lufi.ui;
  * que uma reprodução é parada.</p>
  */
 enum PlayerErrorCode {
-    LIBVLC_NOT_FOUND("LibVLC não encontrado. Instale VLC/libVLC 3.x compatível ou configure o caminho do VLC."),
+    LIBVLC_NOT_FOUND("O runtime integrado do libVLC não foi encontrado. Reinstale o Luffy ou confira a instalação."),
     MEDIA_OPEN_FAILED("Não foi possível abrir esta mídia no libVLC."),
     MEDIA_DECODE_FAILED("O libVLC não conseguiu decodificar esta mídia."),
     HTTP_STREAM_FAILED("A ponte HTTP local da reprodução falhou."),

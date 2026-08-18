@@ -3,21 +3,30 @@ package dev.lufi.ui;
 import uk.co.caprica.vlcj.factory.discovery.NativeDiscovery;
 import uk.co.caprica.vlcj.factory.discovery.provider.DiscoveryDirectoryProvider;
 import uk.co.caprica.vlcj.factory.discovery.strategy.NativeDiscoveryStrategy;
+import uk.co.caprica.vlcj.binding.lib.LibC;
 
 import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.ServiceLoader;
 import java.util.function.Consumer;
 
 /**
  * Descoberta isolada do runtime nativo do libVLC para o backend vlcj.
  *
- * <p>O mecanismo padrao do vlcj continua sendo a autoridade para carregar a
- * biblioteca. Esta classe apenas valida a plataforma suportada pelo MVP e
- * torna o processo observavel no diagnostico do Luffy.</p>
+ * <p>O Luffy procura primeiro o runtime que vem dentro do próprio pacote da
+ * aplicação. A busca automática do vlcj fica como alternativa de
+ * desenvolvimento/compatibilidade para instalações antigas.</p>
  */
 final class LibVlcRuntimeDiscovery {
     private static final Object DISCOVERY_LOCK = new Object();
+    private static final String BUNDLED_RUNTIME_PROPERTY = "luffy.libvlc.path";
+    private static final String BUNDLED_RUNTIME_ENVIRONMENT = "LUFFY_LIBVLC_HOME";
     private static volatile String discoveredPath;
     private static volatile String discoveredStrategy;
 
@@ -35,9 +44,29 @@ final class LibVlcRuntimeDiscovery {
 
         synchronized (DISCOVERY_LOCK) {
             if (discoveredPath != null) {
-                log.accept("PLAYER BACKEND: libvlc-discovery; phase=automatic; result=already-loaded; "
+                log.accept("PLAYER BACKEND: libvlc-discovery; phase=runtime; result=already-loaded; "
                         + "path=" + discoveredPath + "; strategy=" + discoveredStrategy + ".");
                 return Result.available(discoveredPath, discoveredStrategy);
+            }
+
+            Optional<RuntimeCandidate> bundledRuntime = bundledRuntime(platform, log);
+            if (bundledRuntime.isPresent()) {
+                RuntimeCandidate candidate = bundledRuntime.orElseThrow();
+                BundledNativeDiscoveryStrategy strategy = new BundledNativeDiscoveryStrategy(candidate, platform, log);
+                TracingNativeDiscovery nativeDiscovery = new TracingNativeDiscovery(log, strategy);
+                try {
+                    if (nativeDiscovery.discover()) {
+                        return rememberDiscovery(nativeDiscovery, candidate.pluginsDirectory().toString(), log);
+                    }
+                    log.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; result=load-failed; path="
+                            + candidate.root() + "; fallback=automatic.");
+                } catch (RuntimeException | LinkageError error) {
+                    log.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; result=failed; error="
+                            + error.getClass().getSimpleName() + "; detail=" + safeMessage(error)
+                            + "; fallback=automatic.");
+                }
+            } else {
+                log.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; result=not-found.");
             }
 
             logCandidateDirectories(log);
@@ -46,23 +75,108 @@ final class LibVlcRuntimeDiscovery {
                 if (!nativeDiscovery.discover()) {
                     return Result.unavailable(notFoundMessage());
                 }
-                String path = nativeDiscovery.discoveredPath();
-                String strategy = nativeDiscovery.successfulStrategy() == null
-                        ? "already-loaded"
-                        : nativeDiscovery.successfulStrategy().getClass().getSimpleName();
-                // NativeDiscovery pode retornar true por uma descoberta anterior
-                // no mesmo processo. Nessa situacao o libVLC ja esta carregado.
-                discoveredPath = path == null || path.isBlank() ? "already-loaded" : path;
-                discoveredStrategy = strategy;
-                log.accept("PLAYER BACKEND: libvlc-discovery; result=available; path=" + discoveredPath
-                        + "; strategy=" + discoveredStrategy + ".");
-                return Result.available(discoveredPath, discoveredStrategy);
+                return rememberDiscovery(nativeDiscovery, "", log);
             } catch (RuntimeException | LinkageError error) {
                 String message = notFoundMessage();
                 log.accept("PLAYER BACKEND: libvlc-discovery; result=failed; error="
                         + error.getClass().getSimpleName() + "; detail=" + safeMessage(error) + ".");
                 return Result.unavailable(message);
             }
+        }
+    }
+
+    private static Result rememberDiscovery(TracingNativeDiscovery discovery, String pluginPath, Consumer<String> log) {
+        String path = discovery.discoveredPath();
+        String strategy = discovery.successfulStrategy() == null
+                ? "already-loaded"
+                : discovery.successfulStrategy().getClass().getSimpleName();
+        // NativeDiscovery pode retornar true por uma descoberta anterior no
+        // mesmo processo. Nessa situação a biblioteca já está carregada.
+        discoveredPath = path == null || path.isBlank() ? "already-loaded" : path;
+        discoveredStrategy = strategy;
+        log.accept("PLAYER BACKEND: libvlc-discovery; result=available; path=" + discoveredPath
+                + "; strategy=" + discoveredStrategy
+                + (pluginPath.isBlank() ? "" : "; plugins=" + pluginPath) + ".");
+        return Result.available(discoveredPath, discoveredStrategy, pluginPath);
+    }
+
+    /** Localiza somente cópias completas: biblioteca, core e plugins do VLC. */
+    private static Optional<RuntimeCandidate> bundledRuntime(PlatformInfo platform, Consumer<String> log) {
+        LinkedHashSet<Path> candidates = new LinkedHashSet<>();
+        addPath(candidates, System.getProperty(BUNDLED_RUNTIME_PROPERTY));
+        addPath(candidates, System.getenv(BUNDLED_RUNTIME_ENVIRONMENT));
+        addLauncherCandidates(candidates);
+        addCodeSourceCandidate(candidates);
+
+        for (Path candidate : candidates) {
+            log.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; candidate=" + candidate + ".");
+            if (isBundledRuntime(candidate, platform)) {
+                return Optional.of(new RuntimeCandidate(candidate, candidate.resolve("plugins")));
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static void addLauncherCandidates(LinkedHashSet<Path> candidates) {
+        String rawLauncher = System.getProperty("jpackage.app-path");
+        if (rawLauncher == null || rawLauncher.isBlank()) return;
+        try {
+            Path launcher = Path.of(rawLauncher).toAbsolutePath().normalize();
+            Path launcherDirectory = launcher.getParent();
+            if (launcherDirectory == null) return;
+            // O jpackage preserva o nome do diretório passado em --app-content.
+            // Na imagem Windows ele fica ao lado de app/ e runtime/.
+            candidates.add(launcherDirectory.resolve("vlc"));
+            candidates.add(launcherDirectory.resolve("app").resolve("vlc"));
+            Path imageDirectory = launcherDirectory.getParent();
+            if (imageDirectory != null) {
+                candidates.add(imageDirectory.resolve("lib").resolve("app").resolve("vlc"));
+            }
+        } catch (RuntimeException ignored) {
+            // A inicialização continua com os demais caminhos válidos.
+        }
+    }
+
+    private static void addCodeSourceCandidate(LinkedHashSet<Path> candidates) {
+        try {
+            URI location = LibVlcRuntimeDiscovery.class.getProtectionDomain().getCodeSource().getLocation().toURI();
+            Path codeSource = Path.of(location).toAbsolutePath().normalize();
+            Path applicationDirectory = Files.isDirectory(codeSource) ? codeSource : codeSource.getParent();
+            if (applicationDirectory != null) {
+                candidates.add(applicationDirectory.resolve("vlc"));
+                Path imageDirectory = applicationDirectory.getParent();
+                if (imageDirectory != null) candidates.add(imageDirectory.resolve("vlc"));
+            }
+        } catch (Exception ignored) {
+            // Em ambientes restritos o CodeSource pode não estar disponível.
+        }
+    }
+
+    private static void addPath(LinkedHashSet<Path> candidates, String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) return;
+        try {
+            candidates.add(Path.of(rawPath.trim()).toAbsolutePath().normalize());
+        } catch (RuntimeException ignored) {
+            // Uma configuração malformada não impede a descoberta automática.
+        }
+    }
+
+    private static boolean isBundledRuntime(Path root, PlatformInfo platform) {
+        if (root == null || !Files.isDirectory(root) || !Files.isDirectory(root.resolve("plugins"))) return false;
+        if (platform.windows()) {
+            return Files.isRegularFile(root.resolve("libvlc.dll"))
+                    && Files.isRegularFile(root.resolve("libvlccore.dll"));
+        }
+        try (var files = Files.list(root)) {
+            boolean library = files.anyMatch(file -> file.getFileName().toString().matches("libvlc\\.so(?:\\..*)?"));
+            if (!library) return false;
+        } catch (IOException error) {
+            return false;
+        }
+        try (var files = Files.list(root)) {
+            return files.anyMatch(file -> file.getFileName().toString().matches("libvlccore\\.so(?:\\..*)?"));
+        } catch (IOException error) {
+            return false;
         }
     }
 
@@ -104,8 +218,8 @@ final class LibVlcRuntimeDiscovery {
     }
 
     private static String notFoundMessage() {
-        return "LibVLC nao encontrado. Instale VLC/libVLC 3.x x64 compativel ou configure "
-                + "-Djna.library.path=<diretorio-do-VLC>. Consulte os caminhos tentados no diagnostico.";
+        return "O runtime integrado do libVLC não foi encontrado. Reinstale o Luffy ou configure "
+                + "-D" + BUNDLED_RUNTIME_PROPERTY + "=<diretório-do-libVLC>. Consulte os caminhos tentados no diagnóstico.";
     }
 
     private static String safeMessage(Throwable error) {
@@ -117,26 +231,33 @@ final class LibVlcRuntimeDiscovery {
         private final boolean available;
         private final String path;
         private final String strategy;
+        private final String pluginPath;
         private final String failureMessage;
 
-        private Result(boolean available, String path, String strategy, String failureMessage) {
+        private Result(boolean available, String path, String strategy, String pluginPath, String failureMessage) {
             this.available = available;
             this.path = path;
             this.strategy = strategy;
+            this.pluginPath = pluginPath;
             this.failureMessage = failureMessage;
         }
 
         static Result available(String path, String strategy) {
-            return new Result(true, path, strategy, "");
+            return available(path, strategy, "");
+        }
+
+        static Result available(String path, String strategy, String pluginPath) {
+            return new Result(true, path, strategy, pluginPath == null ? "" : pluginPath, "");
         }
 
         static Result unavailable(String failureMessage) {
-            return new Result(false, "", "", failureMessage);
+            return new Result(false, "", "", "", failureMessage);
         }
 
         boolean available() { return available; }
         String path() { return path; }
         String strategy() { return strategy; }
+        String pluginPath() { return pluginPath; }
         String failureMessage() { return failureMessage; }
     }
 
@@ -159,11 +280,14 @@ final class LibVlcRuntimeDiscovery {
         }
 
         boolean supported() {
-            boolean supportedSystem = osName.contains("windows") || osName.contains("linux");
+            boolean supportedSystem = windows() || linux();
             boolean x64 = osArch.equals("amd64") || osArch.equals("x86_64") || osArch.equals("x64");
             boolean jvm64 = dataModel.isEmpty() || dataModel.equals("64");
             return supportedSystem && x64 && jvm64 && javaSpecificationVersion.equals("21");
         }
+
+        boolean windows() { return osName.contains("windows"); }
+        boolean linux() { return osName.contains("linux"); }
 
         String describe() {
             return "os=" + value(osName) + "; arch=" + value(osArch) + "; jvmBits=" + value(dataModel)
@@ -179,11 +303,48 @@ final class LibVlcRuntimeDiscovery {
         }
     }
 
+    private record RuntimeCandidate(Path root, Path pluginsDirectory) { }
+
+    /** Estratégia que dá precedência ao runtime que é distribuído com o Luffy. */
+    private static final class BundledNativeDiscoveryStrategy implements NativeDiscoveryStrategy {
+        private final RuntimeCandidate candidate;
+        private final PlatformInfo platform;
+        private final Consumer<String> diagnostics;
+
+        private BundledNativeDiscoveryStrategy(RuntimeCandidate candidate, PlatformInfo platform, Consumer<String> diagnostics) {
+            this.candidate = candidate;
+            this.platform = platform;
+            this.diagnostics = diagnostics;
+        }
+
+        @Override public boolean supported() { return true; }
+
+        @Override public String discover() {
+            String plugins = candidate.pluginsDirectory().toString();
+            try {
+                int result = platform.windows()
+                        ? LibC.INSTANCE._putenv("VLC_PLUGIN_PATH=" + plugins)
+                        : LibC.INSTANCE.setenv("VLC_PLUGIN_PATH", plugins, 1);
+                diagnostics.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; pluginPath=" + plugins
+                        + "; configured=" + (result == 0) + ".");
+            } catch (RuntimeException | LinkageError error) {
+                diagnostics.accept("PLAYER BACKEND: libvlc-discovery; phase=bundled; pluginPath=" + plugins
+                        + "; configured=false; error=" + error.getClass().getSimpleName() + ".");
+            }
+            return candidate.root().toString();
+        }
+
+        @Override public boolean onFound(String path) { return true; }
+
+        @Override public boolean onSetPluginPath(String ignoredRoot) { return true; }
+    }
+
     private static final class TracingNativeDiscovery extends NativeDiscovery {
         private final Consumer<String> diagnostics;
 
-        private TracingNativeDiscovery(Consumer<String> diagnostics) {
-            this.diagnostics = diagnostics;
+        private TracingNativeDiscovery(Consumer<String> diagnostics, NativeDiscoveryStrategy... strategies) {
+            super(strategies);
+            this.diagnostics = diagnostics == null ? ignored -> { } : diagnostics;
         }
 
         @Override

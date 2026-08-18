@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+# Registra tipos e protocolo como opções do sistema. Não altera associação
+# padrão: essa escolha permanece sob controle do usuário/ambiente gráfico.
+if command -v update-mime-database >/dev/null 2>&1; then
+  update-mime-database /usr/share/mime || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
+
+exit 0

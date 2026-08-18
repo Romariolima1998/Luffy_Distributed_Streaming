@@ -28,6 +28,16 @@ val linuxJavafx by configurations.creating {
     isCanBeResolved = true
 }
 
+/**
+ * Runtime VLC distribuído com a imagem Windows. Por padrão reutiliza a cópia
+ * oficial instalada na máquina de build; CI pode informar outra origem com
+ * -PbundledVlcWindowsHome=<diretório-do-VLC>.
+ */
+val bundledVlcWindowsHome = providers.gradleProperty("bundledVlcWindowsHome")
+    .map { file(it) }
+    .orElse(providers.provider { file("C:/Program Files/VideoLAN/VLC") })
+val bundledVlcWindowsOutput = layout.buildDirectory.dir("bundled-vlc/windows/vlc")
+
 dependencies {
     implementation("org.xerial:sqlite-jdbc:3.47.1.0")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
@@ -37,8 +47,8 @@ dependencies {
     implementation("com.github.atomashpolskiy:bt-http-tracker-client:1.10")
     implementation("com.github.atomashpolskiy:bt-dht:1.10")
     implementation("com.offbynull.portmapper:portmapper:2.0.6")
-    // Backend libVLC isolado pela MediaPlayerBackend. O VLC nativo continua
-    // sendo descoberto em tempo de execucao e nao e empacotado pelo Luffy.
+    // Backend libVLC isolado pela MediaPlayerBackend. O empacotamento Windows
+    // inclui o runtime VLC 3.x e o descobre antes de qualquer instalação local.
     implementation("uk.co.caprica:vlcj:$vlcjVersion")
     // A superfície JavaFX é implementada no Luffy com CallbackVideoSurface e
     // PixelBuffer. Isso evita a incompatibilidade binária do vlcj-javafx
@@ -155,6 +165,32 @@ tasks.register<Jar>("linuxExecutableJar") {
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "module-info.class", "META-INF/versions/**/module-info.class")
 }
 
+tasks.register<Sync>("prepareBundledVlcWindows") {
+    group = "distribution"
+    description = "Prepara o runtime nativo VLC 3.x que acompanha a distribuição Windows do Luffy."
+    from(bundledVlcWindowsHome)
+    into(bundledVlcWindowsOutput)
+    // O desinstalador pertence à instalação de origem, não ao runtime do Luffy.
+    exclude("uninstall.exe")
+    doFirst {
+        val source = bundledVlcWindowsHome.get()
+        check(source.resolve("libvlc.dll").isFile && source.resolve("libvlccore.dll").isFile
+                && source.resolve("plugins").isDirectory) {
+            "Runtime VLC Windows não encontrado em $source. Instale VLC 3.x x64 na máquina de build " +
+                    "ou informe -PbundledVlcWindowsHome=<diretório-do-VLC>."
+        }
+    }
+    doLast {
+        val runtime = bundledVlcWindowsOutput.get().asFile
+        val cacheGenerator = runtime.resolve("vlc-cache-gen.exe")
+        check(cacheGenerator.isFile) { "vlc-cache-gen.exe não foi copiado para o runtime integrado do Luffy." }
+        exec {
+            executable = cacheGenerator.absolutePath
+            args(runtime.resolve("plugins").absolutePath)
+        }
+    }
+}
+
 tasks.register<Copy>("linuxDistribution") {
     group = "distribution"
     description = "Monta a pasta de distribuição Linux do Luffy."
@@ -181,8 +217,9 @@ tasks.register<Exec>("windowsAppImage") {
     val appImageDestination = providers.gradleProperty("windowsAppImageDestination")
         .map { file(it) }
         .orElse(layout.buildDirectory.dir("windows").map { it.asFile })
-    dependsOn(executableJar)
+    dependsOn(executableJar, "prepareBundledVlcWindows")
     inputs.file(executableJar.flatMap { it.archiveFile })
+    inputs.dir(bundledVlcWindowsOutput)
     // Uma versao em uso no Windows nao pode ser apagada. A propriedade permite
     // publicar uma imagem nova sem interferir em um Luffy.exe aberto.
     doFirst { delete(appImageDestination.get().resolve("Luffy")) }
@@ -197,6 +234,7 @@ tasks.register<Exec>("windowsAppImage") {
         "--name", "Luffy",
         "--main-jar", "Luffy-0.1.0-all.jar",
         "--main-class", "dev.lufi.ui.LuffyLauncher",
+        "--app-content", bundledVlcWindowsOutput.get().asFile.absolutePath,
         "--java-options", "-Dfile.encoding=UTF-8"
     )
     outputs.dir(appImageDestination.map { it.resolve("Luffy") })
@@ -216,9 +254,10 @@ tasks.register<Exec>("windowsInstaller") {
     val installerDestination = providers.gradleProperty("windowsInstallerDestination")
         .map { file(it) }
         .orElse(layout.buildDirectory.dir("windows-installer").map { it.asFile })
-    dependsOn(executableJar)
+    dependsOn(executableJar, "prepareBundledVlcWindows")
     inputs.file(executableJar.flatMap { it.archiveFile })
     inputs.dir(layout.projectDirectory.dir("src/windows/jpackage"))
+    inputs.dir(bundledVlcWindowsOutput)
     val jpackage = javaToolchains.launcherFor {
         languageVersion.set(JavaLanguageVersion.of(21))
     }.get().metadata.installationPath.file("bin/jpackage.exe").asFile
@@ -230,6 +269,7 @@ tasks.register<Exec>("windowsInstaller") {
         "--name", "Luffy",
         "--main-jar", "Luffy-0.1.0-all.jar",
         "--main-class", "dev.lufi.ui.LuffyLauncher",
+        "--app-content", bundledVlcWindowsOutput.get().asFile.absolutePath,
         "--java-options", "-Dfile.encoding=UTF-8",
         "--vendor", "Luffy",
         "--description", "Streaming e downloads BitTorrent no Luffy",

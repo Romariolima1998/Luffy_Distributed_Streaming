@@ -2,4 +2,12 @@
 set -eu
 
 BASE_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# A distribuição Linux inclui o runtime VLC em ./vlc. Estas variáveis precisam
+# existir antes de iniciar a JVM, pois o carregador dinâmico do Linux resolve as
+# bibliotecas nativas do libVLC no momento em que o processo Java é criado.
+if [ -d "$BASE_DIR/vlc" ]; then
+  export LUFFY_LIBVLC_HOME="$BASE_DIR/vlc"
+  export VLC_PLUGIN_PATH="$BASE_DIR/vlc/plugins"
+  export LD_LIBRARY_PATH="$BASE_DIR/vlc:$BASE_DIR/vlc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 exec java -jar "$BASE_DIR/Luffy-0.1.0-linux.jar" "$@"
