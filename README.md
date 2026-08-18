@@ -2,19 +2,18 @@
 
 ## baixe o luffy e execulte sem compilar
 
-e necessario baixar o vlc 3.0.x antes de rodar o luffy : 
-[site oficial do vlc](https://www.videolan.org/)
+[download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/2.0/Luffy-1.0.exe)
 
 
 
-[download para windows](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/1.0/Luffy-1.0.exe)
+[download para linux](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/0.2.0/luffy_1.0.0_amd64.deb)
 
-requizito para linux
+abra o terminal na pasta que tiver baixado e cole o comando
 
 ```
- sudo apt update && sudo apt install openjdk-21-jdk -y
+sudo apt install ./luffy_1.0.0_amd64.deb
+
 ```
-[download para linux](https://github.com/Romariolima1998/Luffy_Distributed_Streaming/releases/download/0.1.0/Luffy-0.1.0-linux.zip)
 
 
 
